@@ -1,7 +1,14 @@
 //! ZGFX (RDP8) Bulk Data Compression
 
+mod api;
 mod circular_buffer;
+mod compressor;
 mod control_messages;
+mod wrapper;
+
+pub use api::{compress_and_wrap_egfx, CompressionMode};
+pub use compressor::Compressor;
+pub use wrapper::{wrap_compressed, wrap_uncompressed};
 
 use std::io::{self, Write as _};
 use std::sync::LazyLock;
@@ -71,7 +78,7 @@ impl Decompressor {
         }
     }
 
-    fn decompress_segment(&mut self, encoded_data: &[u8], output: &mut Vec<u8>) -> Result<usize, ZgfxError> {
+    pub fn decompress_segment(&mut self, encoded_data: &[u8], output: &mut Vec<u8>) -> Result<usize, ZgfxError> {
         if encoded_data.is_empty() {
             return Ok(0);
         }

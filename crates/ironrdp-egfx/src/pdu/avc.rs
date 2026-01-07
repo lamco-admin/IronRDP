@@ -87,7 +87,14 @@ impl Encode for Avc420BitmapStream<'_> {
 
         dst.write_u32(cast_length!("len", self.rectangles.len())?);
         for rectangle in &self.rectangles {
-            rectangle.encode(dst)?;
+            // MS-RDPEGFX 2.2.4.4: RFX_RECT actually uses left, top, right, bottom format
+            // (bounds-based, same as RECTANGLE_16 elsewhere in EGFX)
+            // Previous code incorrectly converted to x,y,width,height
+            // InclusiveRectangle already stores left, top, right, bottom (inclusive)
+            dst.write_u16(rectangle.left);
+            dst.write_u16(rectangle.top);
+            dst.write_u16(rectangle.right);
+            dst.write_u16(rectangle.bottom);
         }
         for quant_qual_val in &self.quant_qual_vals {
             quant_qual_val.encode(dst)?;
@@ -117,7 +124,20 @@ impl<'de> Decode<'de> for Avc420BitmapStream<'de> {
         let mut rectangles = Vec::with_capacity(num_regions_usize);
         let mut quant_qual_vals = Vec::with_capacity(num_regions_usize);
         for _ in 0..num_regions {
-            rectangles.push(InclusiveRectangle::decode(src)?);
+            // MS-RDPEGFX 2.2.4.4: RFX_RECT uses left, top, right, bottom format
+            // (bounds-based, same as RECTANGLE_16)
+            // Read directly into InclusiveRectangle
+            ensure_size!(in: src, size: 8);
+            let left = src.read_u16();
+            let top = src.read_u16();
+            let right = src.read_u16();
+            let bottom = src.read_u16();
+            rectangles.push(InclusiveRectangle {
+                left,
+                top,
+                right,
+                bottom,
+            });
         }
         for _ in 0..num_regions {
             quant_qual_vals.push(QuantQuality::decode(src)?);
@@ -452,6 +472,30 @@ pub fn encode_avc420_bitmap_stream(regions: &[Avc420Region], h264_data: &[u8]) -
     stream
         .encode(&mut cursor)
         .expect("encode_avc420_bitmap_stream: encoding failed");
+
+    // Debug: Log the structure of the bitmap stream
+    use tracing::trace;
+    trace!(
+        "RFX_AVC420_BITMAP_STREAM: total={} bytes, regions={}, h264={} bytes",
+        buf.len(), regions.len(), h264_data.len()
+    );
+
+    // Log hex dump of first 64 bytes for debugging
+    if !buf.is_empty() {
+        let preview_len = core::cmp::min(64, buf.len());
+        let hex_preview: Vec<String> = buf[..preview_len]
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if i > 0 && i % 16 == 0 {
+                    format!("\n       {:02x}", b)
+                } else {
+                    format!("{:02x}", b)
+                }
+            })
+            .collect();
+        trace!("RFX_AVC420 hex (first {}): {}", preview_len, hex_preview.join(" "));
+    }
 
     buf
 }
