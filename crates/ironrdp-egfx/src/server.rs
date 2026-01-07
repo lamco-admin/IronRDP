@@ -573,6 +573,9 @@ pub struct GraphicsPipelineServer {
     output_width: u16,
     output_height: u16,
     output_queue: VecDeque<GfxPdu>,
+
+    /// DVC channel ID, set when start() is called
+    channel_id: Option<u32>,
 }
 
 impl GraphicsPipelineServer {
@@ -592,6 +595,7 @@ impl GraphicsPipelineServer {
             output_width: 0,
             output_height: 0,
             output_queue: VecDeque::new(),
+            channel_id: None,
         }
     }
 
@@ -633,6 +637,24 @@ impl GraphicsPipelineServer {
     #[must_use]
     pub fn output_dimensions(&self) -> (u16, u16) {
         (self.output_width, self.output_height)
+    }
+
+    /// Set the graphics output buffer dimensions
+    ///
+    /// This updates the expected output size. Use `resize()` if you also need
+    /// to send resize commands to the client.
+    pub fn set_output_dimensions(&mut self, width: u16, height: u16) {
+        self.output_width = width;
+        self.output_height = height;
+    }
+
+    /// Get the DVC channel ID
+    ///
+    /// Returns `None` if the channel hasn't been started yet.
+    /// The channel ID is set when `start()` is called by the DVC infrastructure.
+    #[must_use]
+    pub fn channel_id(&self) -> Option<u32> {
+        self.channel_id
     }
 
     // ========================================================================
@@ -1051,7 +1073,10 @@ impl DvcProcessor for GraphicsPipelineServer {
         CHANNEL_NAME
     }
 
-    fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        // Store channel_id for proactive frame sending
+        self.channel_id = Some(channel_id);
+        debug!(channel_id, "EGFX channel started");
         // Server waits for client CapabilitiesAdvertise before sending anything
         Ok(vec![])
     }
