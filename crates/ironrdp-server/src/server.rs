@@ -32,6 +32,8 @@ use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayUpdate, RdpServerDisplay};
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
+#[cfg(feature = "egfx")]
+use crate::gfx::{EgfxServerMessage, GfxServerFactory};
 use crate::handler::RdpServerInputHandler;
 use crate::{builder, capabilities, SoundServerFactory};
 
@@ -217,6 +219,8 @@ pub struct RdpServer {
     static_channels: StaticChannelSet,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+    #[cfg(feature = "egfx")]
+    gfx_factory: Option<Box<dyn GfxServerFactory>>,
     ev_sender: mpsc::UnboundedSender<ServerEvent>,
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
@@ -230,6 +234,9 @@ pub enum ServerEvent {
     Rdpsnd(RdpsndServerMessage),
     SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
+    /// EGFX (Graphics Pipeline) server events for proactive frame sending
+    #[cfg(feature = "egfx")]
+    Egfx(EgfxServerMessage),
 }
 
 pub trait ServerEventSender {
@@ -250,6 +257,38 @@ enum RunState {
 }
 
 impl RdpServer {
+    #[cfg(feature = "egfx")]
+    pub fn new(
+        opts: RdpServerOptions,
+        handler: Box<dyn RdpServerInputHandler>,
+        display: Box<dyn RdpServerDisplay>,
+        mut sound_factory: Option<Box<dyn SoundServerFactory>>,
+        mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+        gfx_factory: Option<Box<dyn GfxServerFactory>>,
+    ) -> Self {
+        let (ev_sender, ev_receiver) = ServerEvent::create_channel();
+        if let Some(cliprdr) = cliprdr_factory.as_mut() {
+            cliprdr.set_sender(ev_sender.clone());
+        }
+        if let Some(snd) = sound_factory.as_mut() {
+            snd.set_sender(ev_sender.clone());
+        }
+        Self {
+            opts,
+            handler: Arc::new(Mutex::new(handler)),
+            display: Arc::new(Mutex::new(display)),
+            static_channels: StaticChannelSet::new(),
+            sound_factory,
+            cliprdr_factory,
+            gfx_factory,
+            ev_sender,
+            ev_receiver: Arc::new(Mutex::new(ev_receiver)),
+            creds: None,
+            local_addr: None,
+        }
+    }
+
+    #[cfg(not(feature = "egfx"))]
     pub fn new(
         opts: RdpServerOptions,
         handler: Box<dyn RdpServerInputHandler>,
@@ -302,11 +341,28 @@ impl RdpServer {
         }
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
-        let dvc = dvc::DrdynvcServer::new()
+        let mut dvc = dvc::DrdynvcServer::new()
             .with_dynamic_channel(AInputHandler {
                 handler: Arc::clone(&self.handler),
             })
             .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+
+        // Add EGFX (Graphics Pipeline) DVC if configured
+        #[cfg(feature = "egfx")]
+        if let Some(gfx_factory) = self.gfx_factory.as_deref() {
+            // Try bridge pattern first (enables proactive frame sending via Arc<Mutex<>>)
+            if let Some((bridge, _handle)) = gfx_factory.build_server_with_handle() {
+                // Bridge wraps Arc<Mutex<GraphicsPipelineServer>> for shared access
+                // The _handle is retained by the factory/display handler for frame sending
+                dvc = dvc.with_dynamic_channel(bridge);
+            } else {
+                // Fall back to basic handler-only mode (no proactive frame sending)
+                let handler = gfx_factory.build_gfx_handler();
+                let gfx_server = ironrdp_egfx::server::GraphicsPipelineServer::new(handler);
+                dvc = dvc.with_dynamic_channel(gfx_server);
+            }
+        }
+
         acceptor.attach_static_channel(dvc);
     }
 
@@ -569,6 +625,30 @@ impl RdpServer {
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
                     let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
+                }
+                #[cfg(feature = "egfx")]
+                ServerEvent::Egfx(msg) => {
+                    // EGFX messages are pre-encoded SvcMessages for the DRDYNVC channel
+                    match msg {
+                        EgfxServerMessage::SendMessages { channel_id: dvc_channel_id, messages } => {
+                            // Get the DRDYNVC static channel ID for encoding
+                            let drdynvc_channel_id = self
+                                .get_channel_id_by_type::<dvc::DrdynvcServer>()
+                                .ok_or_else(|| anyhow!("DRDYNVC channel not found"))?;
+                            trace!(
+                                dvc_channel_id = dvc_channel_id,
+                                svc_channel_id = drdynvc_channel_id,
+                                message_count = messages.len(),
+                                "ServerEvent::Egfx - sending EGFX PDUs"
+                            );
+                            let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
+                            trace!(
+                                bytes = data.len(),
+                                "Writing EGFX data to wire"
+                            );
+                            writer.write_all(&data).await?;
+                        }
+                    }
                 }
             }
         }
@@ -910,9 +990,33 @@ impl RdpServer {
                 }
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
+                    let svc_name = svc.channel_name();
                     let response_pdus = svc.process(&data.user_data)?;
+                    if !response_pdus.is_empty() {
+                        debug!(
+                            channel_id = data.channel_id,
+                            channel_name = ?svc_name,
+                            response_count = response_pdus.len(),
+                            "SVC process returned response PDUs (includes EGFX CapabilitiesConfirm if DRDYNVC)"
+                        );
+                    }
                     let response = server_encode_svc_messages(response_pdus, data.channel_id, user_channel_id)?;
+                    if !response.is_empty() {
+                        debug!(
+                            channel_id = data.channel_id,
+                            channel_name = ?svc_name,
+                            response_bytes = response.len(),
+                            "Writing SVC response to wire (CapabilitiesConfirm goes through here!)"
+                        );
+                    }
                     writer.write_all(&response).await?;
+                    if !response.is_empty() {
+                        debug!(
+                            channel_id = data.channel_id,
+                            channel_name = ?svc_name,
+                            "SVC response written to wire successfully"
+                        );
+                    }
                 } else {
                     warn!(channel_id = data.channel_id, "Unexpected channel received: ID",);
                 }

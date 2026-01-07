@@ -6,6 +6,8 @@ use tokio_rustls::TlsAcceptor;
 
 use super::clipboard::CliprdrServerFactory;
 use super::display::{DesktopSize, RdpServerDisplay};
+#[cfg(feature = "egfx")]
+use super::gfx::GfxServerFactory;
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use super::server::{RdpServer, RdpServerOptions, RdpServerSecurity};
 use crate::{DisplayUpdate, RdpServerDisplayUpdates, SoundServerFactory};
@@ -31,6 +33,8 @@ pub struct BuilderDone {
     display: Box<dyn RdpServerDisplay>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
+    #[cfg(feature = "egfx")]
+    gfx_factory: Option<Box<dyn GfxServerFactory>>,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -124,6 +128,8 @@ impl RdpServerBuilder<WantsDisplay> {
                 sound_factory: None,
                 cliprdr_factory: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
+                #[cfg(feature = "egfx")]
+                gfx_factory: None,
             },
         }
     }
@@ -138,6 +144,8 @@ impl RdpServerBuilder<WantsDisplay> {
                 sound_factory: None,
                 cliprdr_factory: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
+                #[cfg(feature = "egfx")]
+                gfx_factory: None,
             },
         }
     }
@@ -151,6 +159,35 @@ impl RdpServerBuilder<BuilderDone> {
 
     pub fn with_sound_factory(mut self, sound: Option<Box<dyn SoundServerFactory>>) -> Self {
         self.state.sound_factory = sound;
+        self
+    }
+
+    /// Configure EGFX (Graphics Pipeline Extension) for H.264 video streaming
+    ///
+    /// The graphics factory creates a handler that receives EGFX callbacks
+    /// and can send H.264 encoded frames to the client.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use ironrdp_server::{RdpServer, GfxServerFactory};
+    /// use ironrdp_egfx::server::GraphicsPipelineHandler;
+    ///
+    /// struct MyGfxFactory;
+    /// impl GfxServerFactory for MyGfxFactory {
+    ///     fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
+    ///         // Return your handler implementation
+    ///     }
+    /// }
+    ///
+    /// let server = RdpServer::builder()
+    ///     // ... other configuration
+    ///     .with_gfx_factory(Some(Box::new(MyGfxFactory)))
+    ///     .build();
+    /// ```
+    #[cfg(feature = "egfx")]
+    pub fn with_gfx_factory(mut self, gfx_factory: Option<Box<dyn GfxServerFactory>>) -> Self {
+        self.state.gfx_factory = gfx_factory;
         self
     }
 
@@ -170,6 +207,8 @@ impl RdpServerBuilder<BuilderDone> {
             self.state.display,
             self.state.sound_factory,
             self.state.cliprdr_factory,
+            #[cfg(feature = "egfx")]
+            self.state.gfx_factory,
         )
     }
 }
