@@ -4,6 +4,8 @@ use std::io;
 pub(crate) struct FixedCircularBuffer {
     buffer: Vec<u8>,
     position: usize,
+    /// Total bytes written (for tracking if buffer is full)
+    total_written: usize,
 }
 
 impl FixedCircularBuffer {
@@ -11,7 +13,27 @@ impl FixedCircularBuffer {
         Self {
             buffer: vec![0; size],
             position: 0,
+            total_written: 0,
         }
+    }
+
+    /// Returns the number of bytes currently available in history
+    pub(crate) fn len(&self) -> usize {
+        // If we haven't written enough to fill the buffer, return total written
+        // Otherwise, return buffer capacity (full)
+        self.total_written.min(self.buffer.len())
+    }
+
+    /// Peek at a byte at a specific offset from current position
+    ///
+    /// Returns None if offset is beyond the current available history
+    pub(crate) fn peek_at_offset(&self, offset: usize) -> Option<u8> {
+        if offset == 0 || offset > self.len() {
+            return None;
+        }
+
+        let position = (self.buffer.len() + self.position - offset) % self.buffer.len();
+        Some(self.buffer[position])
     }
 
     pub(crate) fn read_with_offset(&self, offset: usize, length: usize, output: &mut impl io::Write) -> io::Result<()> {
@@ -72,6 +94,9 @@ impl io::Write for FixedCircularBuffer {
         if self.position == self.buffer.len() {
             self.position = 0;
         }
+
+        // Track total bytes written
+        self.total_written += bytes_written;
 
         Ok(bytes_written)
     }
@@ -155,6 +180,7 @@ mod tests {
         let circular_buffer = FixedCircularBuffer {
             buffer: vec![11, 12, 13, 14, 15, 16, 7, 8, 9, 10],
             position: 6,
+            total_written: 10,
         };
         let expected = vec![11, 12, 13, 14];
 
@@ -168,6 +194,7 @@ mod tests {
         let circular_buffer = FixedCircularBuffer {
             buffer: vec![11, 12, 13, 14, 15, 16, 7, 8, 9, 10],
             position: 6,
+            total_written: 10,
         };
         let expected = vec![8, 9, 10, 11, 12, 13, 14];
 
@@ -181,6 +208,7 @@ mod tests {
         let circular_buffer = FixedCircularBuffer {
             buffer: vec![11, 12, 13, 14, 15, 16, 7, 8, 9, 10],
             position: 6,
+            total_written: 10,
         };
         let expected = vec![16; 7];
 
@@ -194,6 +222,7 @@ mod tests {
         let circular_buffer = FixedCircularBuffer {
             buffer: vec![11, 12, 13, 14, 15, 16, 7, 8, 9, 10],
             position: 6,
+            total_written: 10,
         };
         let expected = vec![14, 15, 16, 14, 15, 16, 14];
 
@@ -207,6 +236,7 @@ mod tests {
         let circular_buffer = FixedCircularBuffer {
             buffer: vec![11, 12, 3, 4, 5, 6, 7, 8, 9, 10],
             position: 2,
+            total_written: 10,
         };
         let expected = vec![9, 10, 11, 12, 9, 10, 11];
 
