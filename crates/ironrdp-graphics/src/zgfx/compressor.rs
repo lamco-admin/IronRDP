@@ -44,31 +44,26 @@ const MIN_MATCH_LENGTH: usize = 3;
 const MAX_MATCH_LENGTH: usize = 65535; // Practical limit
 const MAX_MATCH_DISTANCE: usize = 2_097_152; // Max for last token
 
-/// Maximum number of candidate positions to check per prefix
-/// Limits worst-case performance when many positions share the same prefix
+/// Limits worst-case performance when many positions share the same 3-byte prefix
 const MAX_CANDIDATES: usize = 16;
 
-/// Maximum positions per hash table entry
-/// Prevents unbounded growth for common prefixes
+/// Prevents unbounded growth for frequently occurring prefixes
 const MAX_POSITIONS_PER_PREFIX: usize = 32;
 
-/// Maximum total hash table entries before cleanup
-/// Keeps memory usage bounded
+/// Triggers cleanup to keep memory usage bounded
 const MAX_HASH_TABLE_ENTRIES: usize = 50_000;
 
 /// ZGFX Compressor with history buffer and hash table for fast match finding
 pub struct Compressor {
-    /// History buffer containing previously compressed data
+    /// Previously compressed data that can be referenced by back-references
     history: Vec<u8>,
 
-    /// Hash table mapping 3-byte prefixes to positions in history
-    /// Key: [u8; 3] representing a 3-byte sequence
-    /// Value: Vec<usize> of positions where this prefix occurs in history
+    /// Maps 3-byte prefixes to history positions for O(1) match lookup
+    /// (avoids O(n) scan of 2.5MB history buffer)
     match_table: HashMap<[u8; 3], Vec<usize>>,
 }
 
 impl Compressor {
-    /// Create a new ZGFX compressor
     pub fn new() -> Self {
         Self {
             history: Vec::with_capacity(HISTORY_SIZE),
@@ -76,39 +71,27 @@ impl Compressor {
         }
     }
 
-    /// Compress data using ZGFX algorithm
+    /// Compress data using ZGFX algorithm.
     ///
-    /// Returns compressed data with ZGFX token encoding.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - Data to compress
-    ///
-    /// # Returns
-    ///
-    /// Compressed data ready to be wrapped in ZGFX segment structure
+    /// Returns compressed data ready to be wrapped in ZGFX segment structure.
     pub fn compress(&mut self, input: &[u8]) -> Result<Vec<u8>, ZgfxError> {
         let mut bit_writer = BitWriter::new();
         let mut pos = 0;
 
         while pos < input.len() {
-            // Try to find a match in history
+            // Matches compress better than literals - worth the lookup cost
             let best_match = self.find_best_match(input, pos);
 
             if let Some(m) = best_match {
                 if m.length >= MIN_MATCH_LENGTH {
-                    // Encode as match
                     self.encode_match(&mut bit_writer, m.distance, m.length)?;
-
-                    // Add matched bytes to history
+                    // Extend history so future input can reference these bytes
                     self.add_to_history(&input[pos..pos + m.length]);
-
                     pos += m.length;
                     continue;
                 }
             }
 
-            // Encode as literal
             let byte = input[pos];
             self.encode_literal(&mut bit_writer, byte)?;
             self.add_to_history(&[byte]);
@@ -118,54 +101,40 @@ impl Compressor {
         Ok(bit_writer.finish())
     }
 
-    /// Add bytes to history buffer (managing size limit and hash table)
+    /// Add bytes to history buffer, managing the 2.5MB sliding window
     fn add_to_history(&mut self, bytes: &[u8]) {
-        // Handle history buffer overflow
+        // ZGFX uses a 2.5MB sliding window - drop oldest bytes when full
         if self.history.len() + bytes.len() > HISTORY_SIZE {
             let overflow = (self.history.len() + bytes.len()) - HISTORY_SIZE;
 
-            // Remove old bytes from history
             self.history.drain(..overflow);
 
-            // Update hash table: shift all positions down by overflow amount
-            // and remove positions that are now negative
+            // Shift hash table positions to account for removed bytes
             for positions in self.match_table.values_mut() {
-                // Update positions, removing those that were drained
                 positions.retain_mut(|pos| {
                     if *pos >= overflow {
                         *pos -= overflow;
                         true
                     } else {
-                        false // Remove this position
+                        false
                     }
                 });
             }
 
-            // Clean up empty entries to save memory
+            // Prevent hash table from accumulating stale empty vectors
             self.match_table.retain(|_, positions| !positions.is_empty());
         }
 
-        // Add new bytes to history first
+        // Must update history before hash table to ensure consistent positions
         let base_pos = self.history.len();
         self.history.extend_from_slice(bytes);
 
-        // Update hash table with ONLY truly new 3-byte sequences
-        // We add:
-        // 1. Sequences that start in the newly added bytes
-        // 2. Sequences that span the boundary (start in old, extend into new)
-        //
-        // CRITICAL: Only add each position ONCE to avoid duplicates
+        // CRITICAL: Only add each position ONCE to avoid duplicates that cause
+        // exponential slowdown (bug fix: positions were being added multiple times)
 
-        // Add sequences starting in new bytes
-        // OPTIMIZATION: For large chunks (matches), don't add every position
-        // Sample positions to keep hash table manageable
-        let step_size = if bytes.len() > 256 {
-            // For large chunks (matches), sample every 4th position
-            4
-        } else {
-            // For small chunks (literals), add all positions
-            1
-        };
+        // OPTIMIZATION: For large chunks (matches), sample every 4th position
+        // to keep hash table manageable while maintaining good compression
+        let step_size = if bytes.len() > 256 { 4 } else { 1 };
 
         for i in (0..bytes.len().saturating_sub(MIN_MATCH_LENGTH - 1)).step_by(step_size) {
             let pos = base_pos + i;
@@ -179,28 +148,24 @@ impl Compressor {
                 .entry(prefix)
                 .or_insert_with(Vec::new);
 
-            // Limit positions per prefix to prevent unbounded growth
             if entry.len() < MAX_POSITIONS_PER_PREFIX {
                 entry.push(pos);
             } else {
-                // Replace oldest position with newest (sliding window)
+                // Sliding window: keep most recent positions for better compression
                 entry.remove(0);
                 entry.push(pos);
             }
         }
 
-        // Periodic hash table cleanup if it gets too large
         if self.match_table.len() > MAX_HASH_TABLE_ENTRIES {
             self.compact_hash_table();
         }
 
-        // Add sequences that span the boundary
-        // Only if we actually added bytes and have prior history
+        // Handle sequences that span the old/new boundary
         if base_pos >= 2 && bytes.len() >= 1 {
             let pos = base_pos - 2;
             if pos + MIN_MATCH_LENGTH <= self.history.len() {
                 let prefix = [self.history[pos], self.history[pos + 1], self.history[pos + 2]];
-                // Check if this position isn't already in the table (avoid duplicates)
                 let entry = self.match_table.entry(prefix).or_insert_with(Vec::new);
                 if entry.last() != Some(&pos) {
                     entry.push(pos);
@@ -219,61 +184,45 @@ impl Compressor {
         }
     }
 
-    /// Compact hash table by keeping only recent positions
-    ///
-    /// Called when hash table grows too large. Keeps only the most recent
-    /// positions for each prefix to maintain performance.
+    /// Keep only recent positions to bound memory usage
     fn compact_hash_table(&mut self) {
         for positions in self.match_table.values_mut() {
             if positions.len() > MAX_POSITIONS_PER_PREFIX / 2 {
-                // Keep only the most recent half
                 let keep_from = positions.len() - (MAX_POSITIONS_PER_PREFIX / 2);
                 *positions = positions[keep_from..].to_vec();
             }
         }
 
-        // Remove empty entries
         self.match_table.retain(|_, positions| !positions.is_empty());
     }
 
-    /// Find the best match in the history buffer using hash table
+    /// Find best match using hash table for O(1) candidate lookup
     ///
-    /// This is the performance-critical function. It uses a hash table to find
-    /// candidate positions in O(1) instead of scanning the entire history in O(n).
-    ///
-    /// Algorithm:
-    /// 1. Extract 3-byte prefix from input at current position
-    /// 2. Look up candidate positions in hash table (O(1))
-    /// 3. Check only those candidates (typically 1-16) for best match
-    /// 4. Return longest match found
+    /// This is performance-critical: hash table avoids O(n) scan of 2.5MB history.
     fn find_best_match(&self, input: &[u8], pos: usize) -> Option<Match> {
         let remaining = input.len() - pos;
         if remaining < MIN_MATCH_LENGTH || self.history.is_empty() {
             return None;
         }
 
-        // Extract 3-byte prefix for hash table lookup
+        // 3 bytes = minimum match length per ZGFX spec
         let prefix = [input[pos], input[pos + 1], input[pos + 2]];
 
-        // O(1) hash table lookup to get candidate positions
         let candidates = self.match_table.get(&prefix)?;
 
         let max_match_len = remaining.min(MAX_MATCH_LENGTH);
         let mut best_match: Option<Match> = None;
         let search_limit = self.history.len().min(MAX_MATCH_DISTANCE);
 
-        // Check candidates in reverse order (most recent first)
-        // Limit to MAX_CANDIDATES to bound worst-case performance
+        // Check most recent candidates first (better locality, often better matches)
         for &hist_pos in candidates.iter().rev().take(MAX_CANDIDATES) {
             let distance = self.history.len() - hist_pos;
 
-            // Skip if outside search limit
             if distance > search_limit {
                 continue;
             }
 
-            // We already know first 3 bytes match (that's why we're here)
-            // Start checking from byte 3
+            // First 3 bytes already match (that's how we found this candidate)
             let mut match_len = MIN_MATCH_LENGTH;
 
             while match_len < max_match_len
@@ -283,7 +232,6 @@ impl Compressor {
                 match_len += 1;
             }
 
-            // Update best match if this is longer
             if let Some(ref current_best) = best_match {
                 if match_len > current_best.length {
                     best_match = Some(Match { distance, length: match_len });
@@ -292,8 +240,7 @@ impl Compressor {
                 best_match = Some(Match { distance, length: match_len });
             }
 
-            // Early exit optimization: stop if we found a very good match
-            // (diminishing returns beyond this point)
+            // Diminishing returns beyond 32 bytes - stop early
             if match_len >= 32 {
                 break;
             }
@@ -302,9 +249,9 @@ impl Compressor {
         best_match
     }
 
-    /// Find the appropriate match token for a given distance
+    /// Select appropriate token from MS-RDPEGFX encoding table
     fn find_match_token(distance: usize) -> MatchToken {
-        // Match tokens are entries 26-39 in TOKEN_TABLE
+        // Tokens 26-39 encode matches with increasing distance ranges
         for token in TOKEN_TABLE.iter().skip(26) {
             if let super::TokenType::Match {
                 distance_value_size,
@@ -322,7 +269,7 @@ impl Compressor {
             }
         }
 
-        // If distance exceeds all ranges, use last token
+        // Last token covers distances up to 2MB (full history range)
         if let super::TokenType::Match {
             distance_value_size,
             distance_base,
@@ -338,9 +285,9 @@ impl Compressor {
         }
     }
 
-    /// Find literal token index for a byte value
+    /// Check if byte has a dedicated short encoding
     fn find_literal_token(byte: u8) -> Option<usize> {
-        // Literal tokens are entries 1-25 in TOKEN_TABLE
+        // Tokens 1-25 provide shorter encodings for common byte values
         for (i, token) in TOKEN_TABLE.iter().enumerate().take(26).skip(1) {
             if let super::TokenType::Literal { literal_value } = token.ty {
                 if literal_value == byte {
@@ -351,57 +298,47 @@ impl Compressor {
         None
     }
 
-    /// Encode a literal byte
     fn encode_literal(&self, writer: &mut BitWriter, byte: u8) -> Result<(), ZgfxError> {
-        // Check if there's a literal token for this byte
+        // Common bytes (0x00, 0xFF, etc.) have shorter dedicated tokens
         if let Some(token_idx) = Self::find_literal_token(byte) {
             let token = &TOKEN_TABLE[token_idx];
             writer.write_bits_from_slice(token.prefix);
         } else {
-            // Use null literal: "0" + 8 bits
+            // Null literal: "0" prefix + 8-bit value (fallback for uncommon bytes)
             writer.write_bit(false);
             writer.write_bits(byte as u32, 8);
         }
         Ok(())
     }
 
-    /// Encode a match (back-reference)
     fn encode_match(&self, writer: &mut BitWriter, distance: usize, length: usize) -> Result<(), ZgfxError> {
-        // Find and encode the distance token
         let match_token = Self::find_match_token(distance);
 
-        // Write match token prefix
         writer.write_bits_from_slice(match_token.prefix);
 
-        // Write distance value
         let distance_value = distance - match_token.distance_base;
         writer.write_bits(distance_value as u32, match_token.distance_value_size);
 
-        // Encode length
         self.encode_match_length(writer, length)?;
 
         Ok(())
     }
 
-    /// Encode match length
     fn encode_match_length(&self, writer: &mut BitWriter, length: usize) -> Result<(), ZgfxError> {
         if length == 3 {
-            // Special case: single "0" bit
+            // Length 3 has special single-bit encoding per spec
             writer.write_bit(false);
         } else {
-            // Calculate token_size from length
-            // length = base + value, where base = 2^(token_size+1)
+            // Variable-length encoding: length = 2^(token_size+1) + value
             let length_token_size = (length as f64).log2().floor() as usize - 1;
             let base = 1 << (length_token_size + 1);
             let value = length - base;
 
-            // Write token_size "1" bits + one "0" bit
             for _ in 0..length_token_size {
                 writer.write_bit(true);
             }
             writer.write_bit(false);
 
-            // Write value bits
             writer.write_bits(value as u32, length_token_size + 1);
         }
 
@@ -415,21 +352,19 @@ impl Default for Compressor {
     }
 }
 
-/// Match found in history buffer
 #[derive(Debug, Clone, Copy)]
 struct Match {
     distance: usize,
     length: usize,
 }
 
-/// Match token information
 struct MatchToken {
     prefix: &'static BitSlice<u8, Msb0>,
     distance_value_size: usize,
     distance_base: usize,
 }
 
-/// Bit-level writer for ZGFX token encoding
+/// Bit-level writer for ZGFX token encoding (MSB first)
 struct BitWriter {
     bytes: Vec<u8>,
     current_byte: u8,
@@ -445,7 +380,6 @@ impl BitWriter {
         }
     }
 
-    /// Write a single bit (MSB first)
     fn write_bit(&mut self, bit: bool) {
         if bit {
             self.current_byte |= 1 << (7 - self.bits_in_current);
@@ -459,7 +393,6 @@ impl BitWriter {
         }
     }
 
-    /// Write multiple bits from a u32 (MSB first)
     fn write_bits(&mut self, value: u32, num_bits: usize) {
         for i in (0..num_bits).rev() {
             let bit = (value >> i) & 1 == 1;
@@ -467,28 +400,25 @@ impl BitWriter {
         }
     }
 
-    /// Write bits from a BitSlice
     fn write_bits_from_slice(&mut self, bits: &BitSlice<u8, Msb0>) {
         for bit in bits {
             self.write_bit(*bit);
         }
     }
 
-    /// Finish writing and return bytes with padding indicator
+    /// Finalize output with ZGFX-required padding indicator byte
     fn finish(mut self) -> Vec<u8> {
-        // Calculate unused bits in the last byte
         let unused_bits = if self.bits_in_current == 0 {
             0
         } else {
             8 - self.bits_in_current
         };
 
-        // Flush current byte if it has any bits
         if self.bits_in_current > 0 {
             self.bytes.push(self.current_byte);
         }
 
-        // Add padding byte indicating unused bits
+        // ZGFX format requires trailing byte indicating unused bits in final byte
         self.bytes.push(unused_bits as u8);
 
         self.bytes
@@ -510,9 +440,8 @@ mod tests {
         let mut compressor = Compressor::new();
         let compressed = compressor.compress(&[]).unwrap();
 
-        // Should just be padding byte
         assert_eq!(compressed.len(), 1);
-        assert_eq!(compressed[0], 0); // No unused bits
+        assert_eq!(compressed[0], 0);
     }
 
     #[test]
@@ -520,8 +449,7 @@ mod tests {
         let mut compressor = Compressor::new();
         let compressed = compressor.compress(&[0x42]).unwrap();
 
-        // Should be encoded as null literal: "0" + 8 bits + padding
-        // Total: 9 bits = 2 bytes + padding byte
+        // Null literal: "0" + 8 bits + padding = 9 bits = 2 bytes + padding byte
         assert!(compressed.len() >= 2);
     }
 
@@ -548,7 +476,6 @@ mod tests {
         let mut compressor = Compressor::new();
         let mut decompressor = Decompressor::new();
 
-        // Data with repetition should compress better using matches
         let data = b"AAAAAAAAAABBBBBBBBBBCCCCCCCCCC";
         let compressed = compressor.compress(data).unwrap();
 
@@ -557,7 +484,6 @@ mod tests {
 
         assert_eq!(&output, data);
 
-        // Should achieve some compression
         println!(
             "Original: {} bytes, Compressed: {} bytes, Ratio: {:.2}x",
             data.len(),
@@ -573,7 +499,6 @@ mod tests {
         let mut compressor = Compressor::new();
         let mut decompressor = Decompressor::new();
 
-        // Large data with patterns
         let mut data = Vec::new();
         for i in 0..1000 {
             data.extend_from_slice(b"Pattern");
@@ -599,17 +524,15 @@ mod tests {
     fn test_bit_writer() {
         let mut writer = BitWriter::new();
 
-        // Write some bits
-        writer.write_bit(true); // 1
-        writer.write_bit(false); // 0
-        writer.write_bit(true); // 1
-        writer.write_bits(0b101, 3); // 101
+        writer.write_bit(true);
+        writer.write_bit(false);
+        writer.write_bit(true);
+        writer.write_bits(0b101, 3);
 
-        // Should be: 10110100 + padding
         let result = writer.finish();
-        assert_eq!(result.len(), 2); // 1 data byte + 1 padding byte
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0], 0b10110100);
-        assert_eq!(result[1], 2); // 2 unused bits
+        assert_eq!(result[1], 2);
     }
 
     #[test]
@@ -617,11 +540,9 @@ mod tests {
         let compressor = Compressor::new();
         let mut writer = BitWriter::new();
 
-        // Encode 0x00 which has a literal token (index 1: 11000)
         compressor.encode_literal(&mut writer, 0x00).unwrap();
 
         let result = writer.finish();
-        // Should start with 11000...
         assert!(!result.is_empty());
     }
 
@@ -630,15 +551,10 @@ mod tests {
         let compressor = Compressor::new();
         let mut writer = BitWriter::new();
 
-        // Encode a byte without a literal token (e.g., 0x42)
         compressor.encode_literal(&mut writer, 0x42).unwrap();
 
         let result = writer.finish();
-        // Should be: 0 + 01000010 (0x42) + padding = 9 bits
-        // = 2 data bytes + 1 padding indicator byte = 3 total
         assert_eq!(result.len(), 3);
-        // First byte should be 00100001 (bits 0-7)
-        // Second byte should be 00000000 (bit 8 plus padding)
-        assert_eq!(result[2], 7); // 7 unused bits in last byte
+        assert_eq!(result[2], 7);
     }
 }
