@@ -8,7 +8,7 @@
 //! Tile state management and EGFX integration belong in a higher layer.
 
 use ironrdp_pdu::codecs::rfx::progressive::ComponentCodecQuant;
-use ironrdp_pdu::codecs::rfx::{EntropyAlgorithm, Quant};
+use ironrdp_pdu::codecs::rfx::EntropyAlgorithm;
 
 use crate::dwt_extrapolate::BandInfo;
 use crate::rlgr::RlgrError;
@@ -41,7 +41,7 @@ pub const SIGN_NEGATIVE: i8 = -1;
 ///
 /// # Arguments
 /// - `data`: RLGR1-encoded coefficient stream
-/// - `base_quant`: base quantization values (from region quant table)
+/// - `base_quant`: base quantization values (from region quant table, `ComponentCodecQuant` format)
 /// - `prog_quant`: progressive quantization BitPos values for this quality level
 /// - `use_reduce_extrapolate`: whether to use asymmetric band sizes
 /// - `coefficients`: output buffer for decoded coefficients (4096 i16)
@@ -55,7 +55,7 @@ pub const SIGN_NEGATIVE: i8 = -1;
 /// Returns `RlgrError` if RLGR decoding fails.
 pub fn decode_first_pass(
     data: &[u8],
-    base_quant: &Quant,
+    base_quant: &ComponentCodecQuant,
     prog_quant: &ComponentCodecQuant,
     use_reduce_extrapolate: bool,
     coefficients: &mut [i16],
@@ -71,7 +71,7 @@ pub fn decode_first_pass(
     crate::subband_reconstruction::decode(&mut coefficients[ll3_offset(use_reduce_extrapolate)..]);
 
     // Step 3: Base dequantization (shift left by quant - 1)
-    dequantize_component(coefficients, base_quant, use_reduce_extrapolate);
+    dequantize_component_ccq(coefficients, base_quant, use_reduce_extrapolate);
 
     // Step 4: Progressive dequantization (shift left by BitPos)
     progressive_dequantize(coefficients, prog_quant, use_reduce_extrapolate);
@@ -249,32 +249,23 @@ pub fn progressive_quantize(coefficients: &mut [i16], prog_quant: &ComponentCode
     }
 }
 
-/// Base dequantization using the classic RFX `Quant` struct.
+/// Base dequantization using `ComponentCodecQuant` (progressive-format quantization).
 ///
-/// Each band is shifted left by `(quant_value - 1)`. Uses the band layout
-/// for correct offsets when reduce-extrapolate is active.
-fn dequantize_component(coefficients: &mut [i16], quant: &Quant, use_reduce_extrapolate: bool) {
-    if use_reduce_extrapolate {
-        // Use reduce-extrapolate band layout
-        let bands = crate::dwt_extrapolate::band_layout();
-        // Band order in buffer: HL1, LH1, HH1, HL2, LH2, HH2, HL3, LH3, HH3, LL3
-        let quant_per_band = [
-            quant.hl1, quant.lh1, quant.hh1, quant.hl2, quant.lh2, quant.hh2, quant.hl3, quant.lh3, quant.hh3,
-            quant.ll3,
-        ];
-        for (band, &q) in bands.iter().zip(quant_per_band.iter()) {
-            let factor = i16::from(q).saturating_sub(1);
-            if factor > 0 {
-                let start = band.offset;
-                let end = start + band.count();
-                for coeff in &mut coefficients[start..end] {
-                    *coeff <<= factor;
-                }
+/// Each band is shifted left by `(quant_value - 1)`. Uses `for_band()` to map
+/// band indices to quant values, which handles the progressive nibble ordering.
+fn dequantize_component_ccq(coefficients: &mut [i16], quant: &ComponentCodecQuant, use_reduce_extrapolate: bool) {
+    let bands = get_band_layout(use_reduce_extrapolate);
+
+    for (band_idx, band) in bands.iter().enumerate() {
+        let q = quant.for_band(band_idx);
+        let factor = i16::from(q).saturating_sub(1);
+        if factor > 0 {
+            let start = band.offset;
+            let end = start + band.count();
+            for coeff in &mut coefficients[start..end] {
+                *coeff <<= factor;
             }
         }
-    } else {
-        // Standard band sizes, use existing quantization function
-        crate::quantization::decode(coefficients, quant);
     }
 }
 
@@ -476,7 +467,7 @@ impl TileState {
     pub fn decode_first(
         &mut self,
         component_data: [&[u8]; 3],
-        base_quants: [&Quant; 3],
+        base_quants: [&ComponentCodecQuant; 3],
         prog_quants: [ComponentCodecQuant; 3],
         quant_idx: [u8; 3],
         quality: u8,
@@ -661,6 +652,327 @@ impl SurfaceTiles {
             return None;
         }
         Some(usize::from(y_idx) * usize::from(self.tiles_wide) + usize::from(x_idx))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Progressive decoder (EGFX integration)
+// ---------------------------------------------------------------------------
+
+/// Decoded tile pixel data for compositing onto a surface.
+pub struct DecodedTile {
+    /// Tile grid X coordinate (tile column).
+    pub x_idx: u16,
+    /// Tile grid Y coordinate (tile row).
+    pub y_idx: u16,
+    /// RGBA pixel data (64x64 = 16384 bytes).
+    pub pixels: Vec<u8>,
+}
+
+/// Error type for progressive decoding operations.
+#[derive(Debug)]
+pub enum ProgressiveDecodeError {
+    /// PDU parsing failed.
+    Pdu(ironrdp_core::DecodeError),
+    /// RLGR decode failed within a tile.
+    Rlgr(RlgrError),
+    /// The progressive stream is missing a required block.
+    MissingBlock(&'static str),
+    /// Tile coordinates are out of bounds for the surface.
+    TileOutOfBounds { x_idx: u16, y_idx: u16 },
+    /// Region references a quant index beyond the table.
+    InvalidQuantIndex { index: usize, table_len: usize },
+}
+
+impl core::fmt::Display for ProgressiveDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Pdu(e) => write!(f, "progressive PDU decode: {e}"),
+            Self::Rlgr(e) => write!(f, "progressive RLGR decode: {e}"),
+            Self::MissingBlock(name) => write!(f, "progressive stream missing {name} block"),
+            Self::TileOutOfBounds { x_idx, y_idx } => {
+                write!(f, "tile ({x_idx}, {y_idx}) out of surface bounds")
+            }
+            Self::InvalidQuantIndex { index, table_len } => {
+                write!(f, "quant index {index} exceeds table length {table_len}")
+            }
+        }
+    }
+}
+
+impl From<ironrdp_core::DecodeError> for ProgressiveDecodeError {
+    fn from(e: ironrdp_core::DecodeError) -> Self {
+        Self::Pdu(e)
+    }
+}
+
+impl From<RlgrError> for ProgressiveDecodeError {
+    fn from(e: RlgrError) -> Self {
+        Self::Rlgr(e)
+    }
+}
+
+/// Per-context progressive state, identified by codec_context_id.
+struct ProgressiveContext {
+    surface: SurfaceTiles,
+}
+
+/// High-level progressive bitmap decoder for EGFX WireToSurface2 processing.
+///
+/// Maintains per-context tile state across frames, keyed by `codec_context_id`.
+/// Feed it progressive bitmap data from `WireToSurface2Pdu.bitmap_data` and
+/// get back decoded RGBA tiles for compositing.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut decoder = ProgressiveDecoder::new();
+///
+/// // On receiving WireToSurface2Pdu:
+/// let tiles = decoder.decode_bitmap(
+///     pdu.codec_context_id,
+///     surface_width, surface_height,
+///     &pdu.bitmap_data,
+/// )?;
+///
+/// for tile in &tiles {
+///     blit_tile(surface, tile.x_idx, tile.y_idx, &tile.pixels);
+/// }
+/// ```
+pub struct ProgressiveDecoder {
+    contexts: alloc::collections::BTreeMap<u32, ProgressiveContext>,
+}
+
+extern crate alloc;
+
+impl ProgressiveDecoder {
+    /// Create a new progressive decoder with no context state.
+    pub fn new() -> Self {
+        Self {
+            contexts: alloc::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Decode a progressive bitmap stream from WireToSurface2Pdu.
+    ///
+    /// Parses the progressive block stream, updates per-tile state, and
+    /// returns RGBA pixel data for each tile that was updated.
+    ///
+    /// # Arguments
+    /// - `codec_context_id`: context ID from the WireToSurface2Pdu
+    /// - `surface_width`: surface width in pixels (for tile grid sizing)
+    /// - `surface_height`: surface height in pixels
+    /// - `bitmap_data`: raw progressive block stream from the PDU
+    pub fn decode_bitmap(
+        &mut self,
+        codec_context_id: u32,
+        surface_width: u16,
+        surface_height: u16,
+        bitmap_data: &[u8],
+    ) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
+        use ironrdp_pdu::codecs::rfx::progressive::{decode_progressive_stream, ProgressiveBlock};
+
+        let blocks = decode_progressive_stream(bitmap_data)?;
+
+        // Extract context flags from the CONTEXT block
+        let mut use_reduce_extrapolate = false;
+        for block in &blocks {
+            if let ProgressiveBlock::Context(ctx) = block {
+                use_reduce_extrapolate = ctx.uses_reduce_extrapolate();
+                break;
+            }
+        }
+
+        // Get or create the context for this codec_context_id
+        let context = self
+            .contexts
+            .entry(codec_context_id)
+            .or_insert_with(|| ProgressiveContext {
+                surface: SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate),
+            });
+
+        // If surface dimensions changed, reallocate
+        let expected_wide = surface_width.div_ceil(64);
+        let expected_high = surface_height.div_ceil(64);
+        if context.surface.tiles_wide != expected_wide || context.surface.tiles_high != expected_high {
+            context.surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate);
+        }
+        context.surface.use_reduce_extrapolate = use_reduce_extrapolate;
+
+        let mut decoded_tiles = Vec::new();
+
+        // Process REGION blocks (the main content)
+        for block in &blocks {
+            let region = match block {
+                ProgressiveBlock::Region(r) => r,
+                _ => continue,
+            };
+
+            let quant_vals = &region.quant_vals;
+            let prog_quant_vals = &region.quant_prog_vals;
+
+            for tile_block in &region.tiles {
+                let tiles = decode_tile_block(
+                    &mut context.surface,
+                    tile_block,
+                    quant_vals,
+                    prog_quant_vals,
+                    use_reduce_extrapolate,
+                )?;
+                decoded_tiles.extend(tiles);
+            }
+        }
+
+        Ok(decoded_tiles)
+    }
+
+    /// Delete a codec context, freeing its tile state.
+    ///
+    /// Called when the server sends RDPGFX_DELETE_ENCODING_CONTEXT.
+    pub fn delete_context(&mut self, codec_context_id: u32) {
+        self.contexts.remove(&codec_context_id);
+    }
+
+    /// Reset all contexts (e.g., on EGFX channel reset).
+    pub fn reset(&mut self) {
+        self.contexts.clear();
+    }
+}
+
+#[expect(
+    clippy::similar_names,
+    reason = "q_y/q_cb/q_cr are standard component quant index names"
+)]
+fn decode_tile_block(
+    surface: &mut SurfaceTiles,
+    tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
+    quant_vals: &[ComponentCodecQuant],
+    prog_quant_vals: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveCodecQuant],
+    use_reduce_extrapolate: bool,
+) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
+    use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
+
+    match tile_block {
+        ProgressiveTile::Simple(tile) => {
+            let x_idx = tile.x_idx;
+            let y_idx = tile.y_idx;
+
+            let tile_state = surface
+                .get_or_create(x_idx, y_idx)
+                .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
+
+            let q_y = usize::from(tile.quant_idx_y);
+            let q_cb = usize::from(tile.quant_idx_cb);
+            let q_cr = usize::from(tile.quant_idx_cr);
+
+            if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
+                return Err(ProgressiveDecodeError::InvalidQuantIndex {
+                    index: q_y.max(q_cb).max(q_cr),
+                    table_len: quant_vals.len(),
+                });
+            }
+
+            // TILE_SIMPLE uses lossless progressive quant (no progressive refinement)
+            let prog = ComponentCodecQuant::LOSSLESS;
+
+            tile_state.decode_first(
+                [tile.y_data, tile.cb_data, tile.cr_data],
+                [&quant_vals[q_y], &quant_vals[q_cb], &quant_vals[q_cr]],
+                [prog, prog, prog],
+                [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
+                0xFF, // full quality
+                use_reduce_extrapolate,
+            )?;
+
+            let mut pixels = vec![0u8; 64 * 64 * 4];
+            tile_state.reconstruct_to_rgba(&mut pixels);
+
+            Ok(vec![DecodedTile { x_idx, y_idx, pixels }])
+        }
+
+        ProgressiveTile::First(tile) => {
+            let x_idx = tile.x_idx;
+            let y_idx = tile.y_idx;
+
+            let tile_state = surface
+                .get_or_create(x_idx, y_idx)
+                .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
+
+            let q_y = usize::from(tile.quant_idx_y);
+            let q_cb = usize::from(tile.quant_idx_cb);
+            let q_cr = usize::from(tile.quant_idx_cr);
+
+            if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
+                return Err(ProgressiveDecodeError::InvalidQuantIndex {
+                    index: q_y.max(q_cb).max(q_cr),
+                    table_len: quant_vals.len(),
+                });
+            }
+
+            let pq_idx = usize::from(tile.quality);
+            if pq_idx >= prog_quant_vals.len() {
+                return Err(ProgressiveDecodeError::InvalidQuantIndex {
+                    index: pq_idx,
+                    table_len: prog_quant_vals.len(),
+                });
+            }
+            let pq = &prog_quant_vals[pq_idx];
+
+            tile_state.decode_first(
+                [tile.y_data, tile.cb_data, tile.cr_data],
+                [&quant_vals[q_y], &quant_vals[q_cb], &quant_vals[q_cr]],
+                [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
+                tile.quality,
+                use_reduce_extrapolate,
+            )?;
+
+            let mut pixels = vec![0u8; 64 * 64 * 4];
+            tile_state.reconstruct_to_rgba(&mut pixels);
+
+            Ok(vec![DecodedTile { x_idx, y_idx, pixels }])
+        }
+
+        ProgressiveTile::Upgrade(tile) => {
+            let x_idx = tile.x_idx;
+            let y_idx = tile.y_idx;
+
+            let tile_state = surface
+                .get_or_create(x_idx, y_idx)
+                .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
+
+            // If this tile hasn't had a first pass, skip the upgrade
+            if tile_state.pass == 0 {
+                return Ok(Vec::new());
+            }
+
+            let pq_idx = usize::from(tile.quality);
+            if pq_idx >= prog_quant_vals.len() {
+                return Err(ProgressiveDecodeError::InvalidQuantIndex {
+                    index: pq_idx,
+                    table_len: prog_quant_vals.len(),
+                });
+            }
+            let pq = &prog_quant_vals[pq_idx];
+
+            tile_state.decode_upgrade(
+                [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
+                [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
+                [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                tile.quality,
+            );
+
+            let mut pixels = vec![0u8; 64 * 64 * 4];
+            tile_state.reconstruct_to_rgba(&mut pixels);
+
+            Ok(vec![DecodedTile { x_idx, y_idx, pixels }])
+        }
+    }
+}
+
+impl Default for ProgressiveDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -930,5 +1242,101 @@ mod tests {
 
         surface.reset();
         assert!(surface.get(0, 0).is_none());
+    }
+
+    #[test]
+    fn decoder_new_is_empty() {
+        let decoder = ProgressiveDecoder::new();
+        assert!(decoder.contexts.is_empty());
+    }
+
+    #[test]
+    fn decoder_delete_nonexistent_context() {
+        let mut decoder = ProgressiveDecoder::new();
+        // Should not panic on non-existent context
+        decoder.delete_context(42);
+    }
+
+    #[test]
+    fn decoder_reset_clears_contexts() {
+        let mut decoder = ProgressiveDecoder::new();
+
+        // Decode a minimal valid stream to create a context
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            encode_progressive_stream, ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu,
+            ProgressiveFrameEndPdu, ProgressiveRegion, ProgressiveSyncPdu,
+        };
+
+        let region = ProgressiveRegion {
+            tile_size: 0x40,
+            rects: vec![],
+            quant_vals: vec![],
+            quant_prog_vals: vec![],
+            flags: 0,
+            tiles: vec![],
+        };
+
+        let blocks = vec![
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 0x0040,
+                flags: 0,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(region),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ];
+
+        let encoded = encode_progressive_stream(&blocks).unwrap();
+        let result = decoder.decode_bitmap(1, 640, 480, &encoded);
+        assert!(result.is_ok());
+        assert_eq!(decoder.contexts.len(), 1);
+
+        decoder.reset();
+        assert!(decoder.contexts.is_empty());
+    }
+
+    #[test]
+    fn decoder_error_display() {
+        let e = ProgressiveDecodeError::MissingBlock("SYNC");
+        assert!(e.to_string().contains("SYNC"));
+
+        let e = ProgressiveDecodeError::TileOutOfBounds { x_idx: 5, y_idx: 10 };
+        assert!(e.to_string().contains("5"));
+        assert!(e.to_string().contains("10"));
+
+        let e = ProgressiveDecodeError::InvalidQuantIndex { index: 3, table_len: 2 };
+        assert!(e.to_string().contains("3"));
+    }
+
+    #[test]
+    fn dequantize_component_ccq_shifts_correctly() {
+        let mut coefficients = vec![0i16; 4096];
+        coefficients[0] = 10; // HL1 band (index 0)
+        coefficients[4032] = 5; // LL3 band (index 9, standard layout)
+
+        let quant = ComponentCodecQuant {
+            ll3: 3,
+            hl3: 0,
+            lh3: 0,
+            hh3: 0,
+            hl2: 0,
+            lh2: 0,
+            hh2: 0,
+            hl1: 4,
+            lh1: 0,
+            hh1: 0,
+        };
+
+        dequantize_component_ccq(&mut coefficients, &quant, false);
+
+        // HL1: shift left by (4 - 1) = 3 -> 10 << 3 = 80
+        assert_eq!(coefficients[0], 80);
+        // LL3: shift left by (3 - 1) = 2 -> 5 << 2 = 20
+        assert_eq!(coefficients[4032], 20);
     }
 }
