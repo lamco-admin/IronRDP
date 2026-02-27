@@ -350,6 +350,16 @@ fn band_zero_count(sign: &[i8], band: &BandInfo) -> usize {
     sign[start..end].iter().filter(|&&s| s == SIGN_ZERO).count()
 }
 
+/// Clamp i32 to u8 range (0-255).
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    reason = "value is clamped to 0..255 before cast"
+)]
+fn clamp_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
 /// Clamp i32 to i16 range.
 #[expect(
     clippy::as_conversions,
@@ -399,6 +409,258 @@ impl<'a> RawBitReader<'a> {
             self.byte_idx += 1;
         }
         bit
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tile state machine
+// ---------------------------------------------------------------------------
+
+/// Per-tile progressive state: coefficients, signs, and quality tracking.
+///
+/// Each tile in a progressive surface maintains this state across decode
+/// passes. The first pass (TILE_SIMPLE or TILE_FIRST) initializes the
+/// coefficients and signs; subsequent upgrade passes (TILE_UPGRADE)
+/// accumulate refinement data.
+///
+/// Memory per tile: ~37 KB (24 KB coefficients + 12 KB signs + metadata).
+pub struct TileState {
+    /// Accumulated DWT coefficients per component (Y, Cb, Cr).
+    pub coefficients: [[i16; COEFFICIENTS_PER_COMPONENT]; 3],
+    /// Tri-state sign tracking per component (DAS array).
+    pub sign: [[i8; COEFFICIENTS_PER_COMPONENT]; 3],
+    /// Progressive quantization BitPos from the last applied pass.
+    pub prog_quant: [ComponentCodecQuant; 3],
+    /// Base quantization indices (Y, Cb, Cr) into the region's quant table.
+    pub quant_idx: [u8; 3],
+    /// Progressive pass counter (0 = no data, 1 = first pass complete, 2+ = upgrade).
+    pub pass: u16,
+    /// Whether the tile was encoded as a difference tile.
+    pub is_difference: bool,
+    /// Last progressive quality byte (0xFF = full quality).
+    pub quality: u8,
+    /// Whether reduce-extrapolate DWT is used for this tile's context.
+    pub use_reduce_extrapolate: bool,
+}
+
+impl TileState {
+    /// Create a new tile with zeroed state.
+    pub fn new() -> Self {
+        Self {
+            coefficients: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
+            sign: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
+            prog_quant: [ComponentCodecQuant::LOSSLESS; 3],
+            quant_idx: [0; 3],
+            pass: 0,
+            is_difference: false,
+            quality: 0,
+            use_reduce_extrapolate: false,
+        }
+    }
+
+    /// Decode a first-pass tile (TILE_SIMPLE or TILE_FIRST).
+    ///
+    /// Resets this tile's state and decodes three components from RLGR1 data.
+    /// After this call, `coefficients` hold DWT-domain values ready for
+    /// inverse DWT + color conversion.
+    ///
+    /// # Arguments
+    /// - `component_data`: RLGR1-encoded data for [Y, Cb, Cr]
+    /// - `base_quants`: base quantization values for [Y, Cb, Cr]
+    /// - `prog_quants`: progressive quantization for [Y, Cb, Cr]
+    /// - `quality`: progressive quality byte
+    /// - `use_reduce_extrapolate`: DWT mode flag
+    ///
+    /// # Errors
+    /// Returns `RlgrError` if any component's RLGR decode fails.
+    pub fn decode_first(
+        &mut self,
+        component_data: [&[u8]; 3],
+        base_quants: [&Quant; 3],
+        prog_quants: [ComponentCodecQuant; 3],
+        quant_idx: [u8; 3],
+        quality: u8,
+        use_reduce_extrapolate: bool,
+    ) -> Result<(), RlgrError> {
+        self.pass = 1;
+        self.quality = quality;
+        self.quant_idx = quant_idx;
+        self.use_reduce_extrapolate = use_reduce_extrapolate;
+        self.is_difference = false;
+        self.prog_quant = prog_quants;
+
+        for c in 0..3 {
+            decode_first_pass(
+                component_data[c],
+                base_quants[c],
+                &prog_quants[c],
+                use_reduce_extrapolate,
+                &mut self.coefficients[c],
+                &mut self.sign[c],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Decode an upgrade-pass tile (TILE_UPGRADE).
+    ///
+    /// Accumulates refinement data into existing coefficients.
+    ///
+    /// # Arguments
+    /// - `srl_data`: SRL-encoded streams for [Y, Cb, Cr]
+    /// - `raw_data`: raw bit streams for [Y, Cb, Cr]
+    /// - `prog_quants`: progressive quantization for this upgrade level
+    /// - `quality`: progressive quality byte for this pass
+    pub fn decode_upgrade(
+        &mut self,
+        srl_data: [&[u8]; 3],
+        raw_data: [&[u8]; 3],
+        prog_quants: [ComponentCodecQuant; 3],
+        quality: u8,
+    ) {
+        let prev_prog_quant = self.prog_quant;
+
+        for c in 0..3 {
+            decode_upgrade_pass(
+                srl_data[c],
+                raw_data[c],
+                &prev_prog_quant[c],
+                &prog_quants[c],
+                self.use_reduce_extrapolate,
+                &mut self.coefficients[c],
+                &mut self.sign[c],
+            );
+        }
+
+        self.prog_quant = prog_quants;
+        self.quality = quality;
+        self.pass += 1;
+    }
+
+    /// Reconstruct the tile to spatial domain and write RGBA pixels.
+    ///
+    /// Applies inverse DWT to each component, then YCbCr-to-RGB color
+    /// conversion. The pixel buffer receives 64x64 RGBA pixels (16384 bytes).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pixels` has fewer than 64 * 64 * 4 = 16384 bytes.
+    #[expect(clippy::similar_names, reason = "y/cb/cr are standard YCbCr component names")]
+    pub fn reconstruct_to_rgba(&self, pixels: &mut [u8]) {
+        assert!(pixels.len() >= 64 * 64 * 4, "pixel buffer too small");
+
+        // Copy coefficients to scratch buffers for in-place DWT
+        let mut y_buf = self.coefficients[0];
+        let mut cb_buf = self.coefficients[1];
+        let mut cr_buf = self.coefficients[2];
+        let mut temp = [0i16; COEFFICIENTS_PER_COMPONENT];
+
+        // Inverse DWT
+        if self.use_reduce_extrapolate {
+            crate::dwt_extrapolate::decode(&mut y_buf, &mut temp);
+            crate::dwt_extrapolate::decode(&mut cb_buf, &mut temp);
+            crate::dwt_extrapolate::decode(&mut cr_buf, &mut temp);
+        } else {
+            let mut dwt_temp = [0i16; COEFFICIENTS_PER_COMPONENT];
+            crate::dwt::decode(&mut y_buf, &mut dwt_temp);
+            crate::dwt::decode(&mut cb_buf, &mut dwt_temp);
+            crate::dwt::decode(&mut cr_buf, &mut dwt_temp);
+        }
+
+        // YCbCr to RGBA conversion
+        for i in 0..64 * 64 {
+            let y = i32::from(y_buf[i]) + 128;
+            let cb = i32::from(cb_buf[i]);
+            let cr = i32::from(cr_buf[i]);
+
+            // ITU-R BT.601 YCbCr to RGB conversion
+            let r = y + ((cr * 91881 + 32768) >> 16);
+            let g = y - ((cb * 22554 + cr * 46802 + 32768) >> 16);
+            let b = y + ((cb * 116130 + 32768) >> 16);
+
+            let off = i * 4;
+            pixels[off] = clamp_u8(r);
+            pixels[off + 1] = clamp_u8(g);
+            pixels[off + 2] = clamp_u8(b);
+            pixels[off + 3] = 0xFF;
+        }
+    }
+}
+
+impl Default for TileState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface tile grid
+// ---------------------------------------------------------------------------
+
+/// Grid of progressive tiles for a single surface.
+///
+/// Manages tile state for a surface identified by its codec context ID.
+/// Tiles are lazily allocated on first access to avoid upfront memory
+/// cost for surfaces that only partially receive progressive updates.
+pub struct SurfaceTiles {
+    /// Width of the surface in tiles (ceildiv of pixel width by 64).
+    pub tiles_wide: u16,
+    /// Height of the surface in tiles.
+    pub tiles_high: u16,
+    /// Whether the associated context uses reduce-extrapolate DWT.
+    pub use_reduce_extrapolate: bool,
+    /// Tile storage, indexed by `y_idx * tiles_wide + x_idx`.
+    /// `None` entries haven't received any progressive data yet.
+    pub tiles: Vec<Option<Box<TileState>>>,
+}
+
+impl SurfaceTiles {
+    /// Create a new tile grid for the given surface dimensions.
+    pub fn new(width_pixels: u16, height_pixels: u16, use_reduce_extrapolate: bool) -> Self {
+        let tiles_wide = width_pixels.div_ceil(64);
+        let tiles_high = height_pixels.div_ceil(64);
+        let count = usize::from(tiles_wide) * usize::from(tiles_high);
+
+        Self {
+            tiles_wide,
+            tiles_high,
+            use_reduce_extrapolate,
+            tiles: core::iter::repeat_with(|| None).take(count).collect(),
+        }
+    }
+
+    /// Get or create the tile at the given grid position.
+    ///
+    /// Returns `None` if the coordinates are out of bounds.
+    pub fn get_or_create(&mut self, x_idx: u16, y_idx: u16) -> Option<&mut TileState> {
+        let idx = self.tile_index(x_idx, y_idx)?;
+        let tile = self.tiles[idx].get_or_insert_with(|| {
+            let mut t = Box::new(TileState::new());
+            t.use_reduce_extrapolate = self.use_reduce_extrapolate;
+            t
+        });
+        Some(tile)
+    }
+
+    /// Get the tile at the given grid position, if it exists.
+    pub fn get(&self, x_idx: u16, y_idx: u16) -> Option<&TileState> {
+        let idx = self.tile_index(x_idx, y_idx)?;
+        self.tiles[idx].as_deref()
+    }
+
+    /// Reset all tiles (e.g., on context reset or surface resize).
+    pub fn reset(&mut self) {
+        for tile in &mut self.tiles {
+            *tile = None;
+        }
+    }
+
+    fn tile_index(&self, x_idx: u16, y_idx: u16) -> Option<usize> {
+        if x_idx >= self.tiles_wide || y_idx >= self.tiles_high {
+            return None;
+        }
+        Some(usize::from(y_idx) * usize::from(self.tiles_wide) + usize::from(x_idx))
     }
 }
 
@@ -614,5 +876,59 @@ mod tests {
 
         // After decode, at least some positions should have been updated
         // (exact values depend on SRL interpretation, but the function shouldn't panic)
+    }
+
+    #[test]
+    fn tile_state_default_is_zeroed() {
+        let tile = TileState::new();
+        assert_eq!(tile.pass, 0);
+        assert_eq!(tile.quality, 0);
+        assert!(!tile.use_reduce_extrapolate);
+        assert!(tile.coefficients[0].iter().all(|&v| v == 0));
+        assert!(tile.sign[0].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn surface_tiles_dimensions() {
+        let surface = SurfaceTiles::new(1920, 1080, true);
+        assert_eq!(surface.tiles_wide, 30);
+        assert_eq!(surface.tiles_high, 17);
+        assert!(surface.use_reduce_extrapolate);
+    }
+
+    #[test]
+    fn surface_tiles_exact_multiple() {
+        // 1280 / 64 = 20, 768 / 64 = 12 (exact, no rounding)
+        let surface = SurfaceTiles::new(1280, 768, false);
+        assert_eq!(surface.tiles_wide, 20);
+        assert_eq!(surface.tiles_high, 12);
+    }
+
+    #[test]
+    fn surface_tiles_lazy_allocation() {
+        let mut surface = SurfaceTiles::new(128, 128, false);
+        // No tiles allocated yet
+        assert!(surface.get(0, 0).is_none());
+
+        // Access creates tile
+        let tile = surface.get_or_create(0, 0).unwrap();
+        assert_eq!(tile.pass, 0);
+        assert!(!tile.use_reduce_extrapolate);
+
+        // Now it exists
+        assert!(surface.get(0, 0).is_some());
+
+        // Out of bounds returns None
+        assert!(surface.get_or_create(2, 2).is_none());
+    }
+
+    #[test]
+    fn surface_tiles_reset() {
+        let mut surface = SurfaceTiles::new(128, 128, false);
+        surface.get_or_create(0, 0);
+        assert!(surface.get(0, 0).is_some());
+
+        surface.reset();
+        assert!(surface.get(0, 0).is_none());
     }
 }
