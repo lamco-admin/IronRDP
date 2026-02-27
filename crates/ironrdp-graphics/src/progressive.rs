@@ -1,11 +1,36 @@
-//! Progressive RFX decode and encode algorithms ([MS-RDPEGFX] 2.2.4.2).
+//! RemoteFX Progressive codec implementation ([MS-RDPEGFX] 2.2.4.2).
 //!
-//! Provides first-pass decode (RLGR1 + progressive dequantization + sign capture)
-//! and upgrade-pass decode (SRL/raw routing by DAS sign state, coefficient
-//! accumulation) for the RemoteFX Progressive codec.
+//! This module implements the full progressive RemoteFX codec for both
+//! client-side decode and server-side encode. The progressive codec delivers
+//! screen updates in multiple passes: a coarse first pass followed by
+//! refinement upgrade passes that progressively improve quality.
 //!
-//! These are pure algorithmic functions operating on coefficient buffers.
-//! Tile state management and EGFX integration belong in a higher layer.
+//! # Architecture
+//!
+//! ## Decode pipeline (client)
+//! - [`decode_first_pass`]: RLGR1 → LL3 delta decode → base dequantization →
+//!   progressive dequantization → DAS sign capture
+//! - [`decode_upgrade_pass`]: SRL/raw routing by DAS sign state → coefficient
+//!   accumulation
+//!
+//! ## Encode pipeline (server)
+//! - [`encode_first_pass`]: forward DWT → base quantization → progressive
+//!   quantization → LL3 delta encode → RLGR1
+//! - [`encode_upgrade_pass`]: per-band SRL + raw bit encoding for refinement
+//! - [`rgba_to_ycbcr`]: ITU-R BT.601 color space conversion
+//!
+//! ## State management
+//! - [`TileState`]: per-tile coefficient and DAS sign storage (~37 KB per tile)
+//! - [`SurfaceTiles`]: lazily-allocated tile grid for a surface
+//! - [`ProgressiveDecoder`]: high-level decoder maintaining per-context state,
+//!   wired into the EGFX `WireToSurface2Pdu` path
+//!
+//! # Progressive quantization
+//!
+//! Progressive regions use [`ComponentCodecQuant`] (different nibble ordering
+//! from classic RFX `Quant`). Each quality level specifies a BitPos per band
+//! that controls how many bits are transmitted. Higher BitPos means fewer bits
+//! (coarser quality). Upgrade passes decrease BitPos, revealing more bits.
 
 use ironrdp_pdu::codecs::rfx::progressive::ComponentCodecQuant;
 use ironrdp_pdu::codecs::rfx::EntropyAlgorithm;
