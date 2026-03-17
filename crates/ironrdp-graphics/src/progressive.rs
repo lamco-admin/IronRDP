@@ -32,8 +32,8 @@
 //! that controls how many bits are transmitted. Higher BitPos means fewer bits
 //! (coarser quality). Upgrade passes decrease BitPos, revealing more bits.
 
-use ironrdp_pdu::codecs::rfx::progressive::ComponentCodecQuant;
 use ironrdp_pdu::codecs::rfx::EntropyAlgorithm;
+use ironrdp_pdu::codecs::rfx::progressive::ComponentCodecQuant;
 
 use crate::dwt_extrapolate::BandInfo;
 use crate::rlgr::RlgrError;
@@ -1021,7 +1021,7 @@ impl ProgressiveDecoder {
         surface_height: u16,
         bitmap_data: &[u8],
     ) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
-        use ironrdp_pdu::codecs::rfx::progressive::{decode_progressive_stream, ProgressiveBlock};
+        use ironrdp_pdu::codecs::rfx::progressive::{ProgressiveBlock, decode_progressive_stream};
 
         let blocks = decode_progressive_stream(bitmap_data)?;
 
@@ -1514,8 +1514,8 @@ mod tests {
 
         // Decode a minimal valid stream to create a context
         use ironrdp_pdu::codecs::rfx::progressive::{
-            encode_progressive_stream, ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu,
-            ProgressiveFrameEndPdu, ProgressiveRegion, ProgressiveSyncPdu,
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, encode_progressive_stream,
         };
 
         let region = ProgressiveRegion {
