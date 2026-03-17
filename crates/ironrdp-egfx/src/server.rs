@@ -1538,13 +1538,9 @@ impl GraphicsPipelineServer {
                         bitmap_data: progressive_data,
                     }));
                 }
-                MixedTilePayload::Avc420 {
-                    regions,
-                    h264_data,
-                } => {
+                MixedTilePayload::Avc420 { regions, h264_data } => {
                     let encoded_stream = encode_avc420_bitmap_stream(&regions, &h264_data);
-                    let target_rect =
-                        Self::compute_dest_rect(&regions, surface.width, surface.height);
+                    let target_rect = Self::compute_dest_rect(&regions, surface.width, surface.height);
 
                     self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
                         surface_id,
