@@ -55,3 +55,16 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "clearcodec_decode"
+path = "fuzz_targets/clearcodec_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clearcodec_round_trip"
+path = "fuzz_targets/clearcodec_round_trip.rs"
+test = false
+doc = false
+bench = false

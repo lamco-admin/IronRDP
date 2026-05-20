@@ -192,3 +192,128 @@ impl ironrdp_cliprdr::backend::CliprdrBackend for NoopCliprdrFuzzBackend {
         0
     }
 }
+
+/// Wire-decode fuzz oracle for the ClearCodec codec.
+///
+/// Feeds arbitrary bytes through `ClearCodecDecoder::decode` with width/height
+/// taken from the first four bytes (little-endian u16 each). Property: no
+/// internal panic, no `unreachable!()`, no out-of-bounds access. Allocation
+/// is bounded by the decoder's own `MAX_DECODE_PIXELS = 8192 * 8192` cap.
+///
+/// Decoder Err is silently dropped. The libFuzzer crash channel is reserved
+/// for internal panics, asserts, and `unreachable!()` reached on
+/// attacker-controlled inputs that the decoder accepted as well-formed.
+#[expect(clippy::panic, reason = "panic is the libFuzzer bug-reporting mechanism")]
+pub fn clearcodec_decode(data: &[u8]) {
+    use ironrdp_graphics::clearcodec::ClearCodecDecoder;
+
+    if data.len() < 4 {
+        return;
+    }
+    let width = u16::from_le_bytes([data[0], data[1]]);
+    let height = u16::from_le_bytes([data[2], data[3]]);
+    let stream = &data[4..];
+
+    let mut decoder = ClearCodecDecoder::new();
+    let _ = decoder.decode(stream, width, height);
+}
+
+/// Round-trip fuzz oracle for ClearCodec: `encode -> decode`, check that
+/// the round-tripped pixels match the input on the BGR channels.
+///
+/// **Why BGR-only and not BGRA:** ClearCodec is documented as lossless per
+/// MS-RDPEGFX 2.2.4.1. The wire format is BGR (3 bytes/pixel); the encoder
+/// accepts BGRA input and discards alpha, and the decoder fills decoded
+/// alpha with 0xFF unconditionally. A BGRA-byte-exact round-trip is
+/// therefore impossible by design for inputs whose alpha differs from 0xFF.
+/// The first version of this oracle checked full BGRA equality and
+/// immediately surfaced that on input `[1,0,1,0,4,255,4,4,255,4]`:
+/// input BGRA=(4,255,4,4), decoded BGRA=(4,255,4,255). Real but
+/// spec-consistent finding; should be documented on the codec's public
+/// API (filed as a comment on PR #1174).
+///
+/// Input layout: `[width_le: u16][height_le: u16][bgr: u8 * width * height
+/// * 3]`. Width and height are bounded so the oracle stays fast-fuzz-
+/// friendly (pixel_count capped at 65,536 = 256x256; the decoder's
+/// 8192*8192 cap is a separate, looser ceiling).
+///
+/// Three properties checked:
+/// 1. Encoder never panics (it returns `Vec<u8>`, no `Result`, so any panic
+///    is a real bug).
+/// 2. Re-decoding the encoder's output succeeds (asymmetric impl gap if
+///    not — separately reported).
+/// 3. Re-decoded BGR triples exactly match the input BGR triples (alpha
+///    bytes ignored, since the codec contract is BGR-lossless).
+#[expect(clippy::panic, reason = "panic is the libFuzzer bug-reporting mechanism")]
+pub fn clearcodec_round_trip(data: &[u8]) {
+    use ironrdp_graphics::clearcodec::{ClearCodecDecoder, ClearCodecEncoder};
+
+    if data.len() < 4 {
+        return;
+    }
+    let width = u16::from_le_bytes([data[0], data[1]]);
+    let height = u16::from_le_bytes([data[2], data[3]]);
+
+    let w = usize::from(width);
+    let h = usize::from(height);
+    let Some(pixel_count) = w.checked_mul(h) else {
+        return;
+    };
+    if pixel_count == 0 || pixel_count > 65_536 {
+        return;
+    }
+    let bgr_size = pixel_count.saturating_mul(3);
+    if data.len() < 4 + bgr_size {
+        return;
+    }
+    let bgr_in = &data[4..4 + bgr_size];
+
+    // Synthesize BGRA input with alpha = 0xFF for each pixel (the codec's
+    // expected input shape; alpha is dropped by the encoder anyway).
+    let mut bgra_in = Vec::with_capacity(pixel_count * 4);
+    for px in 0..pixel_count {
+        bgra_in.push(bgr_in[px * 3]);
+        bgra_in.push(bgr_in[px * 3 + 1]);
+        bgra_in.push(bgr_in[px * 3 + 2]);
+        bgra_in.push(0xFF);
+    }
+
+    let mut encoder = ClearCodecEncoder::new();
+    let encoded = encoder.encode(&bgra_in, width, height);
+
+    let mut decoder = ClearCodecDecoder::new();
+    let Ok(decoded) = decoder.decode(&encoded, width, height) else {
+        panic!(
+            "clearcodec_round_trip: decoder rejected encoder output (width={width}, height={height}, encoded_len={})",
+            encoded.len(),
+        );
+    };
+
+    if decoded.len() != bgra_in.len() {
+        panic!(
+            "clearcodec_round_trip: length mismatch (width={width}, height={height}, expected={}, decoded={})",
+            bgra_in.len(),
+            decoded.len(),
+        );
+    }
+
+    // BGR-only equality check (skip alpha at every 4th byte).
+    for px in 0..pixel_count {
+        let off = px * 4;
+        if decoded[off] != bgra_in[off]
+            || decoded[off + 1] != bgra_in[off + 1]
+            || decoded[off + 2] != bgra_in[off + 2]
+        {
+            panic!(
+                "clearcodec_round_trip: BGR mismatch at pixel {px} \
+                 (width={width}, height={height}): input=({:#x},{:#x},{:#x}) decoded=({:#x},{:#x},{:#x})",
+                bgra_in[off],
+                bgra_in[off + 1],
+                bgra_in[off + 2],
+                decoded[off],
+                decoded[off + 1],
+                decoded[off + 2],
+            );
+        }
+    }
+}
