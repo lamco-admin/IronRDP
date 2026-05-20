@@ -83,3 +83,17 @@ test = false
 doc = false
 bench = false
 
+
+[[bin]]
+name = "progressive_rfx_decode"
+path = "fuzz_targets/progressive_rfx_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "progressive_rfx_multi_pass"
+path = "fuzz_targets/progressive_rfx_multi_pass.rs"
+test = false
+doc = false
+bench = false
