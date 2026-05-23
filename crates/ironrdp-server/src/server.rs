@@ -1244,8 +1244,19 @@ impl RdpServer {
         let dispatch_pdu = async move {
             loop {
                 let (action, bytes) = reader.read_pdu().await?;
+                // D8: per-PDU lock-acquisition + dispatch timing. The `this`
+                // mutex is shared with dispatch_events; when an outbound
+                // event batch is in flight, this lock wait is the latency
+                // that a FrameAcknowledge sees before it reaches its
+                // handler. Log when the dispatch itself or the lock wait
+                // exceeds 50ms.
+                let pdu_len = bytes.len();
+                let lock_start = std::time::Instant::now();
                 let mut this = this.lock().await;
-                match this
+                let lock_wait_ms = lock_start.elapsed().as_millis() as u64;
+
+                let dispatch_start = std::time::Instant::now();
+                let result = this
                     .dispatch_pdu(
                         action,
                         bytes,
@@ -1254,8 +1265,26 @@ impl RdpServer {
                         user_channel_id,
                         message_channel_id,
                     )
-                    .await?
-                {
+                    .await?;
+                let dispatch_ms = dispatch_start.elapsed().as_millis() as u64;
+
+                if lock_wait_ms >= 50 || dispatch_ms >= 50 {
+                    tracing::warn!(
+                        pdu_len,
+                        lock_wait_ms,
+                        dispatch_ms,
+                        "dispatch_pdu stalled — inbound PDU delayed (this.lock contended with dispatch_events?)"
+                    );
+                } else {
+                    tracing::debug!(
+                        pdu_len,
+                        lock_wait_ms,
+                        dispatch_ms,
+                        "dispatch_pdu"
+                    );
+                }
+
+                match result {
                     RunState::Continue => continue,
                     state => break Ok(state),
                 }
@@ -1310,11 +1339,40 @@ impl RdpServer {
                 while let Ok(ev) = ev_receiver.try_recv() {
                     events.push(ev);
                 }
+
+                // D7: per-batch dispatch_events timing. The events Vec can
+                // grow up to 100+ entries; dispatch_server_events holds the
+                // `this` mutex AND the SharedWriter mutex for the full
+                // batch. Log batch size + total dispatch time so operators
+                // can see when an event batch ties up both locks.
+                let batch_size = events.len();
+                let lock_start = std::time::Instant::now();
                 let mut this = this.lock().await;
-                match this
+                let lock_wait_ms = lock_start.elapsed().as_millis() as u64;
+
+                let dispatch_start = std::time::Instant::now();
+                let result = this
                     .dispatch_server_events(&mut events, &mut event_writer, user_channel_id, message_channel_id)
-                    .await?
-                {
+                    .await?;
+                let dispatch_ms = dispatch_start.elapsed().as_millis() as u64;
+
+                if lock_wait_ms >= 50 || dispatch_ms >= 100 {
+                    tracing::warn!(
+                        batch_size,
+                        lock_wait_ms,
+                        dispatch_ms,
+                        "dispatch_events batch stalled — long write or lock contention"
+                    );
+                } else if batch_size > 1 {
+                    tracing::debug!(
+                        batch_size,
+                        lock_wait_ms,
+                        dispatch_ms,
+                        "dispatch_events batch"
+                    );
+                }
+
+                match result {
                     RunState::Continue => continue,
                     state => break Ok(state),
                 }
@@ -1852,11 +1910,44 @@ where
         Self: 'write;
 
     fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
-        Box::pin(async {
+        Box::pin(async move {
+            // D1: time both the lock acquisition and the actual write.
+            // Three concurrent tasks (dispatch_pdu, dispatch_display,
+            // dispatch_events) share this Rc<Mutex<W>>. When the kernel TCP
+            // send buffer fills (slow client), write_all blocks while still
+            // holding the mutex — starving the other two tasks. Logging
+            // both phases tells us whether a stall is "waiting in line for
+            // the writer" (lock-wait) or "TLS write held up by TCP back-
+            // pressure" (write-time).
+            let len = buf.len();
+            let wait_start = std::time::Instant::now();
             let mut writer = self.writer.lock().await;
+            let wait_ms = wait_start.elapsed().as_millis() as u64;
 
-            writer.write_all(buf).await?;
-            Ok(())
+            let write_start = std::time::Instant::now();
+            let res = writer.write_all(buf).await;
+            let write_ms = write_start.elapsed().as_millis() as u64;
+
+            // Threshold: 50ms total budget for one write_all. Anything above
+            // is operationally interesting on a healthy LAN. Logged at WARN
+            // when stalled, DEBUG when fast (so wire-time samples are still
+            // visible during routine debugging).
+            if wait_ms + write_ms >= 50 {
+                tracing::warn!(
+                    bytes = len,
+                    lock_wait_ms = wait_ms,
+                    write_ms,
+                    "SharedWriter.write_all stalled — possible TCP back-pressure or writer-mutex contention"
+                );
+            } else {
+                tracing::debug!(
+                    bytes = len,
+                    lock_wait_ms = wait_ms,
+                    write_ms,
+                    "SharedWriter.write_all"
+                );
+            }
+            res
         })
     }
 }
