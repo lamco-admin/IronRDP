@@ -1,5 +1,5 @@
 use core::net::SocketAddr;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -40,6 +40,7 @@ pub struct BuilderDone {
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
     display_suppressed: Option<Arc<AtomicBool>>,
+    autodetect_rtt: Option<Arc<AtomicU32>>,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -138,6 +139,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 #[cfg(feature = "egfx")]
                 gfx_factory: None,
                 display_suppressed: None,
+                autodetect_rtt: None,
             },
         }
     }
@@ -157,6 +159,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 #[cfg(feature = "egfx")]
                 gfx_factory: None,
                 display_suppressed: None,
+                autodetect_rtt: None,
             },
         }
     }
@@ -223,6 +226,17 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Inject a shared NetworkAutoDetect RTT handle (milliseconds, `u32::MAX`
+    /// until the first measurement). The server writes the latest measured RTT
+    /// to the same instance the backend reads. When not called, the server
+    /// allocates its own (still readable via
+    /// [`RdpServer::autodetect_rtt_handle`]). The value stays `u32::MAX` unless
+    /// auto-detect is enabled via [`RdpServer::enable_autodetect`].
+    pub fn with_autodetect_rtt_handle(mut self, handle: Arc<AtomicU32>) -> Self {
+        self.state.autodetect_rtt = Some(handle);
+        self
+    }
+
     pub fn build(self) -> RdpServer {
         RdpServer::new(
             RdpServerOptions {
@@ -239,6 +253,7 @@ impl RdpServerBuilder<BuilderDone> {
             #[cfg(feature = "egfx")]
             self.state.gfx_factory,
             self.state.display_suppressed,
+            self.state.autodetect_rtt,
         )
     }
 }
