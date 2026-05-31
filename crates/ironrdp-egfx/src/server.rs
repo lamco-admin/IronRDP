@@ -837,28 +837,11 @@ pub trait GraphicsPipelineHandler: Send {
     /// The handler should create surfaces and start sending frames.
     fn on_ready(&mut self, negotiated: &CapabilitySet);
 
-    /// Called when a frame has been acknowledged by the client.
+    /// Called when a frame has been acknowledged by the client
     ///
-    /// The default implementation is empty. Handlers can override to track
-    /// frame ack-related state for flow control.
-    fn on_frame_ack(&mut self, _frame_id: u32, _queue_depth: u32) {}
-
-    /// Called when a frame has been acknowledged, with the full
-    /// `total_frames_decoded` counter from the client.
-    ///
-    /// This is the more complete callback: in addition to `frame_id` and
-    /// `queue_depth`, it exposes the client's running count of decoded frames
-    /// (`total_frames_decoded` from MS-RDPEGFX 2.2.2.13). Computing
-    /// `(encoded_frame_count - total_frames_decoded)` gives an instant signal
-    /// of how far behind the client decoder is, useful for closed-loop flow
-    /// control. See GNOME Remote Desktop `grd_rdp_gfx_frame_controller` for
-    /// a reference pattern.
-    ///
-    /// Default implementation calls [`on_frame_ack`](Self::on_frame_ack) for
-    /// backward compatibility — existing handlers continue to work.
-    fn on_frame_ack_full(&mut self, frame_id: u32, queue_depth: u32, _total_frames_decoded: u32) {
-        self.on_frame_ack(frame_id, queue_depth);
-    }
+    /// `total_frames_decoded` is the client's running decoded-frame count
+    /// (MS-RDPEGFX 2.2.2.13), for decode-backlog flow control.
+    fn on_frame_ack(&mut self, _frame_id: u32, _queue_depth: u32, _total_frames_decoded: u32) {}
 
     /// Called when QoE metrics are received from client (V10+)
     fn on_qoe_metrics(&mut self, _metrics: QoeMetrics) {}
@@ -1864,10 +1847,8 @@ impl GraphicsPipelineServer {
             );
         }
 
-        // Prefer the full callback (includes total_frames_decoded).
-        // Default impl in the trait forwards to on_frame_ack for back-compat.
         self.handler
-            .on_frame_ack_full(pdu.frame_id, queue_depth, pdu.total_frames_decoded);
+            .on_frame_ack(pdu.frame_id, queue_depth, pdu.total_frames_decoded);
     }
 
     fn handle_qoe_frame_acknowledge(&mut self, pdu: QoeFrameAcknowledgePdu) {
