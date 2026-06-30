@@ -1268,20 +1268,22 @@ impl RdpServer {
                     .await?;
                 let dispatch_ms = dispatch_start.elapsed().as_millis() as u64;
 
-                if lock_wait_ms >= 50 || dispatch_ms >= 50 {
+                if lock_wait_ms >= 50 {
                     tracing::warn!(
                         pdu_len,
                         lock_wait_ms,
                         dispatch_ms,
-                        "dispatch_pdu stalled — inbound PDU delayed (this.lock contended with dispatch_events?)"
+                        "dispatch_pdu delayed acquiring this.lock — contended with outbound batch (dispatch_events/dispatch_display)"
                     );
-                } else {
-                    tracing::debug!(
+                } else if dispatch_ms >= 50 {
+                    tracing::warn!(
                         pdu_len,
                         lock_wait_ms,
                         dispatch_ms,
-                        "dispatch_pdu"
+                        "dispatch_pdu ran long after acquiring this.lock immediately — handler or runtime stall, not lock contention"
                     );
+                } else {
+                    tracing::debug!(pdu_len, lock_wait_ms, dispatch_ms, "dispatch_pdu");
                 }
 
                 match result {
@@ -1364,12 +1366,7 @@ impl RdpServer {
                         "dispatch_events batch stalled — long write or lock contention"
                     );
                 } else if batch_size > 1 {
-                    tracing::debug!(
-                        batch_size,
-                        lock_wait_ms,
-                        dispatch_ms,
-                        "dispatch_events batch"
-                    );
+                    tracing::debug!(batch_size, lock_wait_ms, dispatch_ms, "dispatch_events batch");
                 }
 
                 match result {
@@ -1940,12 +1937,7 @@ where
                     "SharedWriter.write_all stalled — possible TCP back-pressure or writer-mutex contention"
                 );
             } else {
-                tracing::debug!(
-                    bytes = len,
-                    lock_wait_ms = wait_ms,
-                    write_ms,
-                    "SharedWriter.write_all"
-                );
+                tracing::debug!(bytes = len, lock_wait_ms = wait_ms, write_ms, "SharedWriter.write_all");
             }
             res
         })
