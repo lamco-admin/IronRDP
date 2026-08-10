@@ -16,7 +16,7 @@ fn default_config(isn: u32) -> ConnectionConfig {
         log_window_size: 6,
         upstream_mtu: 1232,
         downstream_mtu: 1232,
-        idle_timeout: Duration::from_secs(16),
+        idle_timeout: Duration::from_secs(65),
         keep_alive_interval: Duration::from_secs(8),
         ack_delay_timeout: Duration::from_millis(50),
     }
@@ -294,7 +294,7 @@ fn idle_timeout_closes_connection() {
     let (mut client, _server, t) = establish_pair();
 
     // Advance time past idle timeout
-    let idle_time = later(t, 17_000); // 17 seconds > 16 second timeout
+    let idle_time = later(t, 66_000); // 66 seconds > the 65 second timeout
     client.handle_timeout(idle_time);
 
     assert!(client.is_closed());
@@ -403,7 +403,7 @@ fn config_default() {
     assert_eq!(config.log_window_size, 6);
     assert_eq!(config.upstream_mtu, 1232);
     assert_eq!(config.downstream_mtu, 1232);
-    assert_eq!(config.idle_timeout, Duration::from_secs(16));
+    assert_eq!(config.idle_timeout, Duration::from_secs(65));
     assert_eq!(config.keep_alive_interval, Duration::from_secs(8));
     assert_eq!(config.ack_delay_timeout, Duration::from_millis(50));
 }
@@ -435,7 +435,7 @@ fn idle_close_leaves_no_timer_armed() {
 
     // Walk past the keep-alive interval so that timer is armed and due in the
     // same pass as the idle timer, which is the ordering that used to break.
-    for step in [1_000u64, 8_000, 16_000] {
+    for step in [1_000u64, 8_000, 65_000] {
         now = now + Duration::from_millis(step);
         conn.handle_timeout(now);
         while conn.poll_transmit(now).is_some() {}
@@ -482,4 +482,143 @@ fn closed_connection_transmits_nothing_and_arms_nothing() {
     conn.handle_timeout(later);
     assert!(conn.poll_transmit(later).is_none());
     assert_eq!(conn.poll_timeout(), None);
+}
+
+// ── Handshake retransmission ──
+//
+// [MS-RDPEUDP] 1.3.1: the SYN, SYN+ACK and ACK are delivered by persistent
+// retransmits whatever mode the transport is running in. 3.1.5.4.1 stops
+// after somewhere between three and five unanswered tries.
+
+/// Drive the connection to its next retransmit deadline and collect whatever
+/// it decides to send.
+fn advance_to_retransmit(conn: &mut RdpeudpConnection) -> Option<Vec<u8>> {
+    let deadline = conn.poll_timeout()?;
+    conn.handle_timeout(deadline);
+    conn.poll_transmit(deadline).map(|transmit| transmit.contents)
+}
+
+#[test]
+fn unanswered_syn_is_retransmitted() {
+    let t = now();
+    let mut client = RdpeudpConnection::connect(default_config(100), t);
+
+    let first = client.poll_transmit(t).expect("SYN");
+    let again = advance_to_retransmit(&mut client).expect("SYN again");
+
+    assert_eq!(first.contents, again, "the retransmitted SYN differs from the original");
+    assert!(!client.is_closed());
+}
+
+#[test]
+fn unanswered_syn_ack_is_retransmitted() {
+    let t = now();
+
+    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let syn = client.poll_transmit(t).expect("SYN");
+    let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
+
+    let mut server = RdpeudpConnection::accept(default_config(200), &syn_dg, t).expect("accept");
+    let first = server.poll_transmit(t).expect("SYN+ACK");
+    let again = advance_to_retransmit(&mut server).expect("SYN+ACK again");
+
+    assert_eq!(first.contents, again);
+    assert!(!server.is_closed());
+}
+
+#[test]
+fn a_syn_that_is_never_answered_closes_the_connection() {
+    let t = now();
+    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    client.poll_transmit(t).expect("SYN");
+
+    // The retransmit timer keeps firing until the limit is reached. The idle
+    // timer would also close this connection eventually, so the assertion
+    // below is that we gave up on the retransmit count first.
+    let mut retransmits = 0;
+    while !client.is_closed() {
+        let deadline = client.poll_timeout().expect("a timer is armed");
+        assert!(
+            deadline < t + client_idle_timeout(),
+            "gave up on the idle timeout rather than the retransmit limit"
+        );
+
+        client.handle_timeout(deadline);
+        if client.poll_transmit(deadline).is_some() {
+            retransmits += 1;
+        }
+    }
+
+    assert_eq!(retransmits, 5, "[MS-RDPEUDP] 3.1.5.4.1 allows between three and five");
+    assert_eq!(client.poll_event(), Some(Event::ConnectionClosed));
+}
+
+fn client_idle_timeout() -> Duration {
+    default_config(0).idle_timeout
+}
+
+#[test]
+fn a_repeated_syn_draws_another_syn_ack() {
+    let t = now();
+
+    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let syn = client.poll_transmit(t).expect("SYN");
+    let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
+
+    let mut server = RdpeudpConnection::accept(default_config(200), &syn_dg, t).expect("accept");
+    let syn_ack = server.poll_transmit(t).expect("SYN+ACK");
+
+    // The client did not see that SYN+ACK, so it repeats its SYN.
+    let mut repeated = syn.contents;
+    server
+        .handle_datagram(&mut repeated, later(t, 500))
+        .expect("a repeated SYN is not a protocol violation");
+
+    let answer = server.poll_transmit(later(t, 500)).expect("another SYN+ACK");
+    assert_eq!(answer.contents, syn_ack.contents);
+    assert!(!server.is_established());
+}
+
+#[test]
+fn a_repeated_syn_ack_draws_another_final_ack() {
+    let t = now();
+
+    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let syn = client.poll_transmit(t).expect("SYN");
+    let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
+
+    let mut server = RdpeudpConnection::accept(default_config(200), &syn_dg, t).expect("accept");
+    let syn_ack = server.poll_transmit(t).expect("SYN+ACK");
+
+    let mut syn_ack_bytes = syn_ack.contents.clone();
+    client
+        .handle_datagram(&mut syn_ack_bytes, later(t, 50))
+        .expect("handle SYN+ACK");
+    while client.poll_event().is_some() {}
+
+    let final_ack = client.poll_transmit(later(t, 50)).expect("final ACK");
+    assert!(client.is_established());
+
+    // That ACK was lost, so the server repeats its SYN+ACK. The client is on
+    // v2 by now and must still recognise it.
+    let mut repeated = syn_ack.contents;
+    client
+        .handle_datagram(&mut repeated, later(t, 600))
+        .expect("a repeated SYN+ACK is not a protocol violation");
+
+    let answer = client.poll_transmit(later(t, 600)).expect("the final ACK again");
+    assert_eq!(answer.contents, final_ack.contents);
+    assert!(client.is_established(), "the connection did not fall back a state");
+}
+
+#[test]
+fn data_is_not_mistaken_for_a_repeated_syn_ack() {
+    let (mut client, mut server, t) = establish_pair();
+
+    server.send(vec![0x11; 32]).expect("send");
+    let mut data = server.poll_transmit(later(t, 200)).expect("data").contents;
+
+    client.handle_datagram(&mut data, later(t, 250)).expect("handle data");
+
+    assert_eq!(client.poll_event(), Some(Event::DataReceived(vec![0x11; 32])));
 }

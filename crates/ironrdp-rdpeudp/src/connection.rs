@@ -103,12 +103,18 @@ pub struct ConnectionConfig {
     pub downstream_mtu: u16,
 
     /// Idle timeout: connection closes if no packets received within this duration.
-    /// Default: 16 seconds.
+    ///
+    /// Default: 65 seconds, the interval [MS-RDPEUDP] 3.1.1.9 gives for
+    /// deciding the peer has gone. Shortening it below that closes
+    /// connections a conforming peer still considers live.
     pub idle_timeout: Duration,
 
     /// Keep-alive interval: send a probe if no data has been sent for this long.
     /// Should be shorter than the remote's idle timeout.
-    /// Default: 8 seconds.
+    ///
+    /// Default: 8 seconds. The spec asks only that endpoints acknowledge
+    /// "periodically" (3.1.1.9), the point being to hold the NAT binding
+    /// open, so the interval is ours to pick.
     pub keep_alive_interval: Duration,
 
     /// ACK delay timeout: maximum time to hold an ACK before sending it.
@@ -123,7 +129,7 @@ impl Default for ConnectionConfig {
             log_window_size: 6,
             upstream_mtu: 1232,
             downstream_mtu: 1232,
-            idle_timeout: Duration::from_secs(16),
+            idle_timeout: Duration::from_secs(65),
             keep_alive_interval: Duration::from_secs(8),
             ack_delay_timeout: Duration::from_millis(50),
         }
@@ -133,6 +139,15 @@ impl Default for ConnectionConfig {
 // ════════════════════════════════════════════════════════════════════
 // Internal state
 // ════════════════════════════════════════════════════════════════════
+
+/// How many unanswered retransmits of a handshake datagram we tolerate
+/// before closing.
+///
+/// [MS-RDPEUDP] 3.1.5.4.1 puts the cutoff at "at least three and no more
+/// than five", so an endpoint may not give up earlier than three and must
+/// have given up by five. Five is the friendliest conforming choice on a
+/// link that is losing packets.
+const HANDSHAKE_RETRANSMIT_LIMIT: u8 = 5;
 
 /// Connection state in the handshake / lifecycle FSM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +258,18 @@ pub struct RdpeudpConnection {
     /// The AckOfAcks sequence number to send (if any).
     pending_ack_of_acks: Option<u16>,
 
+    /// The last handshake datagram we put on the wire, kept so it can go
+    /// out again. [MS-RDPEUDP] 1.3.1 delivers the SYN, the SYN+ACK and the
+    /// ACK by persistent retransmits whatever mode the transport is in.
+    ///
+    /// The client holds on to its final ACK after establishing, because a
+    /// repeated SYN+ACK is the server saying it never arrived.
+    handshake_datagram: Option<Vec<u8>>,
+
+    /// How many times `handshake_datagram` has been retransmitted by the
+    /// timer. Peer-prompted resends do not count: those got an answer.
+    handshake_retransmits: u8,
+
     /// Timestamp reference for reconstructing 24-bit wire timestamps.
     /// Tracks our local timestamp counter in 4μs units.
     local_timestamp_ref: u64,
@@ -347,6 +374,8 @@ impl RdpeudpConnection {
             cwr_pending: false,
             cn_pending: false,
             pending_ack_of_acks: None,
+            handshake_datagram: None,
+            handshake_retransmits: 0,
             local_timestamp_ref: 0,
             remote_timestamp_ref: 0,
             wire_buf: Vec::with_capacity(1400),
@@ -394,9 +423,44 @@ impl RdpeudpConnection {
         match self.state {
             State::SynSent => self.handle_syn_ack(wire, now),
             State::SynReceived => self.handle_final_ack(wire, now),
-            State::Established => self.handle_v2_packet(wire, now),
+            State::Established => {
+                // A server that missed our final ACK repeats its SYN+ACK, in
+                // the v1 format, long after we have moved on to v2.
+                if self.is_repeated_syn_ack(wire) {
+                    self.resend_handshake_datagram();
+                    return Ok(());
+                }
+
+                self.handle_v2_packet(wire, now)
+            }
             State::Closed => Err(RdpeudpError::connection_closed("handle datagram")),
         }
+    }
+
+    /// Whether `wire` is the server repeating the SYN+ACK we already
+    /// answered.
+    ///
+    /// v1 and v2 datagrams share no framing and no discriminator, so this
+    /// leans on the initial sequence number: a v2 data packet would have to
+    /// carry the exact 32-bit value the server opened with, at the offset
+    /// SYNDATA occupies, to be mistaken for one.
+    fn is_repeated_syn_ack(&self, wire: &[u8]) -> bool {
+        if self.side != Side::Client {
+            return false;
+        }
+
+        let Some(params) = self.params.as_ref() else {
+            return false;
+        };
+
+        let Ok(datagram) = decode::<V1Datagram>(wire) else {
+            return false;
+        };
+
+        datagram.header.flags.contains(V1Flags::SYN | V1Flags::ACK)
+            && datagram
+                .syn_data
+                .is_some_and(|syn_data| syn_data.initial_sequence_number == params.remote_isn)
     }
 
     /// Retrieve the next outgoing packet to send on the wire.
@@ -566,9 +630,7 @@ impl RdpeudpConnection {
             }),
         };
 
-        if let Ok(bytes) = encode_vec(&datagram) {
-            self.pending_transmits.push_back(Transmit { contents: bytes });
-        }
+        self.enqueue_handshake(&datagram);
 
         self.timers.set(Timer::Retransmit, now + self.rtt.rto());
         self.timers.set(Timer::Idle, now + self.config.idle_timeout);
@@ -599,11 +661,42 @@ impl RdpeudpConnection {
             }),
         };
 
-        if let Ok(bytes) = encode_vec(&datagram) {
-            self.pending_transmits.push_back(Transmit { contents: bytes });
-        }
+        self.enqueue_handshake(&datagram);
 
         self.timers.set(Timer::Retransmit, now + self.rtt.rto());
+    }
+
+    /// Queue a handshake datagram and keep a copy for retransmission.
+    ///
+    /// These datagrams have a fixed shape, so the encode cannot fail in
+    /// practice. If it somehow does there is no handshake to be had, and
+    /// silently dropping the packet would leave the caller waiting on a
+    /// connection that will never answer.
+    fn enqueue_handshake(&mut self, datagram: &V1Datagram) {
+        let Ok(bytes) = encode_vec(datagram) else {
+            self.close();
+            return;
+        };
+
+        self.pending_transmits.push_back(Transmit {
+            contents: bytes.clone(),
+        });
+        self.handshake_datagram = Some(bytes);
+        self.handshake_retransmits = 0;
+    }
+
+    /// Put the last handshake datagram back on the wire because the peer
+    /// repeated the one before it, so ours went missing.
+    ///
+    /// Not counted against `HANDSHAKE_RETRANSMIT_LIMIT`: that limit counts
+    /// datagrams sent "without a response" (3.1.5.4.1), and this one is a
+    /// response.
+    fn resend_handshake_datagram(&mut self) {
+        if let Some(datagram) = self.handshake_datagram.as_ref() {
+            self.pending_transmits.push_back(Transmit {
+                contents: datagram.clone(),
+            });
+        }
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -669,6 +762,13 @@ impl RdpeudpConnection {
     fn handle_final_ack(&mut self, wire: &[u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
         let datagram: V1Datagram = decode(wire).map_err(RdpeudpError::decode)?;
 
+        // The client repeats its SYN when our SYN+ACK goes missing. Answer it
+        // again rather than reading it as a protocol violation.
+        if datagram.header.flags.contains(V1Flags::SYN) {
+            self.resend_handshake_datagram();
+            return Ok(());
+        }
+
         if !datagram.header.flags.contains(V1Flags::ACK) {
             return Err(RdpeudpError::invalid_packet(
                 "handle final ACK",
@@ -700,9 +800,7 @@ impl RdpeudpConnection {
             syn_data_ex: None,
         };
 
-        if let Ok(bytes) = encode_vec(&datagram) {
-            self.pending_transmits.push_back(Transmit { contents: bytes });
-        }
+        self.enqueue_handshake(&datagram);
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -715,6 +813,13 @@ impl RdpeudpConnection {
     fn transition_to_established(&mut self, now: MonotonicInstant) {
         self.state = State::Established;
         self.timers.clear(Timer::Retransmit);
+
+        // The client keeps its final ACK: nothing acknowledges that ACK, so
+        // the only sign it was lost is the server repeating its SYN+ACK. The
+        // server, having just received that ACK, has nothing left to repeat.
+        if self.side == Side::Server {
+            self.handshake_datagram = None;
+        }
 
         let params = self
             .params
@@ -1304,11 +1409,36 @@ impl RdpeudpConnection {
         // Apply exponential backoff
         self.rtt.on_timeout();
 
+        if self.state != State::Established {
+            self.retransmit_handshake(now);
+            return;
+        }
+
         // Run loss detection: time-based loss will fire now
         self.run_loss_detection(now);
 
         // Reset the timer if there are still pending packets
         self.update_retransmit_timer(now);
+    }
+
+    /// Resend the handshake datagram the peer has not answered, or close
+    /// once it has had enough chances (3.1.5.4.1).
+    fn retransmit_handshake(&mut self, now: MonotonicInstant) {
+        if self.handshake_datagram.is_none() {
+            return;
+        }
+
+        if self.handshake_retransmits >= HANDSHAKE_RETRANSMIT_LIMIT {
+            self.close();
+            return;
+        }
+
+        self.handshake_retransmits += 1;
+        self.resend_handshake_datagram();
+
+        // 3.1.6.1 wants the timer to keep firing at no less than the same
+        // interval; `on_timeout` above has already backed the RTO off.
+        self.timers.set(Timer::Retransmit, now + self.rtt.rto());
     }
 
     /// Handle ACK delay timer expiry: send a standalone ACK.
