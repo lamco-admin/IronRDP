@@ -35,16 +35,20 @@ pub struct TunnelData {
 impl TunnelData {
     const NAME: &'static str = "RDP_TUNNEL_DATA";
 
-    fn header_length(&self) -> u8 {
-        let sub_size: usize = self.sub_headers.iter().map(TunnelSubHeader::wire_size).sum();
-        // 4 (base header) + sub-headers
-        #[expect(
-            clippy::as_conversions,
-            clippy::cast_possible_truncation,
-            reason = "header length fits in u8 per spec"
-        )]
-        let len = (TunnelHeader::MIN_SIZE + sub_size) as u8;
-        len
+    /// Header bytes, untruncated.
+    ///
+    /// `HeaderLength` is a single byte on the wire, so this can exceed what the
+    /// field holds. [`Self::header_length`] is the checked form that `encode`
+    /// uses; this one exists so `size` can report the true length rather than a
+    /// wrapped one.
+    fn header_length_untruncated(&self) -> usize {
+        TunnelHeader::MIN_SIZE + self.sub_headers.iter().map(TunnelSubHeader::wire_size).sum::<usize>()
+    }
+
+    /// Header bytes as they go on the wire, or `None` when the sub-headers do
+    /// not fit the one-byte `HeaderLength` field.
+    fn header_length(&self) -> Option<u8> {
+        u8::try_from(self.header_length_untruncated()).ok()
     }
 }
 
@@ -52,15 +56,20 @@ impl Encode for TunnelData {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ironrdp_core::ensure_size!(in: dst, size: self.size());
 
+        // Both length fields are narrower than the values they describe, and a
+        // truncated one produces a header that disagrees with the bytes behind
+        // it. Refuse rather than emit that.
+        let header_length = self.header_length().ok_or_else(|| {
+            ironrdp_core::invalid_field_err!(Self::NAME, "HeaderLength", "sub-headers exceed one byte of length")
+        })?;
+        let payload_length = u16::try_from(self.higher_layer_data.len()).map_err(|_| {
+            ironrdp_core::invalid_field_err!(Self::NAME, "PayloadLength", "payload exceeds 65535 bytes")
+        })?;
+
         let header = TunnelHeader {
             action: TunnelAction::Data,
-            #[expect(
-                clippy::as_conversions,
-                clippy::cast_possible_truncation,
-                reason = "payload capped at u16::MAX by callers"
-            )]
-            payload_length: self.higher_layer_data.len() as u16,
-            header_length: self.header_length(),
+            payload_length,
+            header_length,
             sub_headers: self.sub_headers.clone(),
         };
         header.encode(dst)?;
@@ -75,7 +84,7 @@ impl Encode for TunnelData {
     }
 
     fn size(&self) -> usize {
-        usize::from(self.header_length()) + self.higher_layer_data.len()
+        self.header_length_untruncated() + self.higher_layer_data.len()
     }
 }
 

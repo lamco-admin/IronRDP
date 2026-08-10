@@ -67,7 +67,8 @@ fn ack_payload_timestamp_masked() {
 
 #[test]
 fn ack_payload_nibble_packing() {
-    // Verify the 4-bit nibble packing
+    // [MS-RDPEUDP2] 2.2.1.2.1: numDelayedAcks is the low nibble and
+    // delayAckTimeScale the high nibble of byte 6.
     let ack = AckPayload {
         seq_num: 0,
         received_ts: 0,
@@ -76,8 +77,8 @@ fn ack_payload_nibble_packing() {
         delay_ack_time_additions: vec![0; 15],
     };
     let encoded = encode_vec(&ack).expect("encode");
-    // The packed byte should be: (15 << 4) | 8 = 0xF8
-    assert_eq!(encoded[6], 0xF8);
+    // (scale 8 << 4) | count 15 = 0x8F
+    assert_eq!(encoded[6], 0x8F);
 
     let decoded: AckPayload = decode(&encoded).expect("decode");
     assert_eq!(decoded.delay_ack_time_additions.len(), 15);
@@ -98,7 +99,7 @@ fn ack_payload_insufficient_additions() {
         0x00, 0x00, // seq_num
         0x00, 0x00, 0x00, // received_ts
         0x00, // send_ack_time_gap
-        0x50, // numDelayedAcks=5, scale=0
+        0x05, // numDelayedAcks=5 in the low nibble, scale=0 in the high
               // missing 5 addition bytes
     ];
     let result: DecodeResult<AckPayload> = decode(&bytes);
@@ -313,7 +314,7 @@ fn ack_payload_count_follows_the_vector() {
 
         let encoded = encode_vec(&ack).expect("encode");
         assert_eq!(
-            usize::from(encoded[6] >> 4),
+            usize::from(encoded[6] & 0x0F),
             len,
             "packed count disagrees with the vector"
         );

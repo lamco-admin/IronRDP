@@ -880,8 +880,13 @@ impl RdpeudpConnection {
                     }
                 }
                 AckVectorEntry::StateMap { bitmap } => {
-                    // StateMap: 8 bits, each representing one packet starting from current_seq
-                    for bit_pos in 0..8u32 {
+                    // [MS-RDPEUDP2] 2.2.1.2.6 state-map mode: the most
+                    // significant bit is the mode marker and the remaining
+                    // seven carry one sequence number each, so a state-map byte
+                    // covers seven, not eight. Advancing by eight desynchronised
+                    // the cursor from the peer's vector for every entry after
+                    // the first state map.
+                    for bit_pos in 0..7u32 {
                         let received = (bitmap >> bit_pos) & 1 == 1;
                         if received {
                             if let Some(size) = send_window.mark_received(current_seq) {

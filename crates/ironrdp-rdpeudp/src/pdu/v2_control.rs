@@ -94,9 +94,9 @@ impl Encode for DelayAckInfoPayload {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ironrdp_core::ensure_fixed_part_size!(in: dst);
 
-        // High nibble = MaxDelayedAcks, low nibble = reserved (0)
-        let packed = (self.max_delayed_acks & 0x0F) << 4;
-        dst.write_u8(packed);
+        // [MS-RDPEUDP2] 2.2.1.2.3 gives MaxDelayedAcks a whole byte, not a
+        // nibble, so the full range 0..=255 goes out.
+        dst.write_u8(self.max_delayed_acks);
         dst.write_u16(self.delayed_ack_timeout_ms);
 
         Ok(())
@@ -115,8 +115,7 @@ impl Decode<'_> for DelayAckInfoPayload {
     fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         ironrdp_core::ensure_fixed_part_size!(in: src);
 
-        let packed = src.read_u8();
-        let max_delayed_acks = (packed >> 4) & 0x0F;
+        let max_delayed_acks = src.read_u8();
         let delayed_ack_timeout_ms = src.read_u16();
 
         Ok(Self {

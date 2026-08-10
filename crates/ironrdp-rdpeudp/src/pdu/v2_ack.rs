@@ -78,7 +78,10 @@ impl Encode for AckPayload {
             .ok_or_else(|| {
                 ironrdp_core::invalid_field_err!("AckPayload", "numDelayedAcks", "exceeds 4-bit maximum (15)")
             })?;
-        let packed = (num_delayed_acks << 4) | (self.delay_ack_time_scale & 0x0F);
+        // [MS-RDPEUDP2] 2.2.1.2.1: numDelayedAcks occupies bits 48 to 51 and
+        // delayAckTimeScale bits 52 to 55. Bits are numbered
+        // least-significant first, so the count is the low nibble.
+        let packed = ((self.delay_ack_time_scale & 0x0F) << 4) | num_delayed_acks;
         dst.write_u8(packed);
 
         dst.write_slice(&self.delay_ack_time_additions);
@@ -110,8 +113,8 @@ impl Decode<'_> for AckPayload {
         let send_ack_time_gap = src.read_u8();
 
         let packed = src.read_u8();
-        let num_delayed_acks = (packed >> 4) & 0x0F;
-        let delay_ack_time_scale = packed & 0x0F;
+        let num_delayed_acks = packed & 0x0F;
+        let delay_ack_time_scale = (packed >> 4) & 0x0F;
 
         let additions_len = usize::from(num_delayed_acks);
         ironrdp_core::ensure_size!(in: src, size: additions_len);
@@ -259,12 +262,13 @@ impl Encode for AckVectorPayload {
         dst.write_u8(packed);
 
         if let (Some(ts), Some(gap)) = (self.timestamp, self.send_ack_time_gap_ms) {
-            dst.write_u8(gap);
-            // TimeStamp: 3 bytes little-endian
+            // [MS-RDPEUDP2] 2.2.1.2.6 places TimeStamp (bits 24 to 47) before
+            // SendAckTimeGapInMs (bits 48 to 55).
             let ts_bytes = (ts & AckPayload::TIMESTAMP_MASK).to_le_bytes();
             dst.write_u8(ts_bytes[0]);
             dst.write_u8(ts_bytes[1]);
             dst.write_u8(ts_bytes[2]);
+            dst.write_u8(gap);
         }
 
         for entry in &self.entries {
@@ -302,11 +306,11 @@ impl Decode<'_> for AckVectorPayload {
 
         let (timestamp, send_ack_time_gap_ms) = if timestamp_present {
             ironrdp_core::ensure_size!(in: src, size: Self::TIMESTAMP_BLOCK_SIZE);
-            let gap = src.read_u8();
             let ts_b0 = u32::from(src.read_u8());
             let ts_b1 = u32::from(src.read_u8());
             let ts_b2 = u32::from(src.read_u8());
             let ts = ts_b0 | (ts_b1 << 8) | (ts_b2 << 16);
+            let gap = src.read_u8();
             (Some(ts), Some(gap))
         } else {
             (None, None)

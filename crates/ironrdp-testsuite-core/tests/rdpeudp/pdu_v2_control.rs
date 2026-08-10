@@ -48,8 +48,8 @@ fn delay_ack_info_encode() {
     assert_eq!(
         encoded.as_slice(),
         &[
-            0x80, // max_delayed_acks=8 << 4 = 0x80
-            0x96, 0x00, // delayed_ack_timeout_ms = 150 LE
+            0x08, // MaxDelayedAcks is a whole byte per 2.2.1.2.3
+            0x96, 0x00, // DelayedAckTimeoutInMs = 150, little-endian
         ]
     );
     assert_eq!(payload.size(), 3);
@@ -57,7 +57,7 @@ fn delay_ack_info_encode() {
 
 #[test]
 fn delay_ack_info_decode() {
-    let bytes = [0x80, 0x96, 0x00];
+    let bytes = [0x08, 0x96, 0x00];
     let decoded: DelayAckInfoPayload = decode(&bytes).expect("decode");
     assert_eq!(decoded.max_delayed_acks, 8);
     assert_eq!(decoded.delayed_ack_timeout_ms, 150);
@@ -128,4 +128,22 @@ fn ack_of_acks_insufficient_bytes() {
     let bytes = [0x34]; // only 1 byte, need 2
     let result: DecodeResult<AckOfAcksPayload> = decode(&bytes);
     assert!(result.is_err());
+}
+
+/// MaxDelayedAcks is a full byte, so values above 15 survive the round trip.
+///
+/// It was previously packed into a nibble, which silently truncated anything
+/// larger and made the sender's advertised limit unrepresentable.
+#[test]
+fn delay_ack_info_carries_a_full_byte_of_max_delayed_acks() {
+    for max_delayed_acks in [0u8, 15, 16, 200, 255] {
+        let payload = DelayAckInfoPayload {
+            max_delayed_acks,
+            delayed_ack_timeout_ms: 42,
+        };
+
+        let encoded = encode_vec(&payload).expect("encode");
+        assert_eq!(encoded[0], max_delayed_acks);
+        assert_eq!(decode::<DelayAckInfoPayload>(&encoded).expect("decode"), payload);
+    }
 }
