@@ -28,6 +28,20 @@ use crate::stream::SharedIo;
 /// a full Ethernet jumbo frame for safety.
 const RECV_BUF_SIZE: usize = 9000;
 
+/// How many undelivered bytes may pile up in `SharedIo::read_buf` before the
+/// driver stops taking packets off the socket.
+///
+/// Nothing else bounds it. The receive window limits how much the peer may
+/// have in flight, but the driver drains that window into `read_buf` on every
+/// pass, so a peer sending faster than the TLS and tunnel layers consume grows
+/// it without limit and the process runs out of memory.
+///
+/// Ceasing to read is real backpressure rather than a dropped-on-the-floor
+/// policy: unread datagrams stay in the socket buffer, our acknowledgements
+/// stop, and [MS-RDPEUDP2] 3.1.1.2.2's receive window closes on the sender,
+/// which is the protocol's own way of saying "wait".
+const READ_BUF_HIGH_WATER: usize = 1 << 20;
+
 // ════════════════════════════════════════════════════════════════════
 // Driver
 // ════════════════════════════════════════════════════════════════════
@@ -119,11 +133,18 @@ impl Driver {
                 .poll_timeout()
                 .map(|deadline| tokio::time::Instant::from_std(self.clock.deadline(deadline)));
 
+            // Reading a datagram may append to `read_buf`, so stop reading while
+            // it is over its mark and wait for the consumer instead.
+            let has_room = self.read_buf_has_room();
+
             tokio::select! {
                 biased;
 
+                // Branch 0: the consumer caught up, so go round again and read.
+                _ = ReadBufDrained::new(&self.shared), if !has_room => {}
+
                 // Branch 1: Incoming UDP datagram (highest priority)
-                result = self.socket.recv(&mut self.recv_buf) => {
+                result = self.socket.recv(&mut self.recv_buf), if has_room => {
                     let n = result.map_err(|error| DriverError::socket("receive datagram", error))?;
                     let now = self.clock.now();
 
@@ -199,6 +220,16 @@ impl Driver {
         }
     }
 
+    /// Whether `read_buf` is under its high-water mark.
+    ///
+    /// A poisoned lock means the stream side is gone, in which case there is
+    /// no reason to keep throttling; the loop will notice and exit.
+    fn read_buf_has_room(&self) -> bool {
+        self.shared
+            .lock()
+            .map_or(true, |shared| shared.read_buf.len() < READ_BUF_HIGH_WATER)
+    }
+
     /// Send all pending transmits to the UDP socket.
     async fn drain_transmits(&mut self) -> Result<(), DriverError> {
         let now = self.clock.now();
@@ -250,6 +281,36 @@ impl Driver {
 /// the stream is shut down.
 ///
 /// Cancel-safe: only registers a waker, no side effects on drop.
+/// Resolves once `read_buf` has fallen back under its high-water mark.
+struct ReadBufDrained {
+    shared: Arc<Mutex<SharedIo>>,
+}
+
+impl ReadBufDrained {
+    fn new(shared: &Arc<Mutex<SharedIo>>) -> Self {
+        Self {
+            shared: Arc::clone(shared),
+        }
+    }
+}
+
+impl Future for ReadBufDrained {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let Ok(mut shared) = self.shared.lock() else {
+            return Poll::Ready(());
+        };
+
+        if shared.read_buf.len() < READ_BUF_HIGH_WATER || shared.closed {
+            return Poll::Ready(());
+        }
+
+        shared.read_drained_waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
 struct WriteDataReady {
     shared: Arc<Mutex<SharedIo>>,
 }
@@ -349,6 +410,54 @@ mod tests {
 
         // Abort the driver (we only needed to test the initial SYN)
         handle.abort();
+    }
+
+    /// The driver stops reading once `read_buf` is full, and starts again once
+    /// the consumer has taken bytes out.
+    ///
+    /// The resume half is the part that is easy to leave out: without a wake
+    /// from `poll_read` the driver sits throttled until some unrelated timer
+    /// happens to fire, which on an idle connection is the keep-alive, eight
+    /// seconds away.
+    #[tokio::test]
+    async fn a_full_read_buffer_throttles_the_driver_until_it_drains() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let conn = RdpeudpConnection::connect(test_connection_config(), Clock::new().now()).expect("connect");
+
+        let shared = Arc::new(Mutex::new(SharedIo::new()));
+        let driver = Driver::new(socket, conn, Arc::clone(&shared), Arc::new(Notify::new()));
+
+        assert!(driver.read_buf_has_room(), "an empty buffer has room");
+
+        shared
+            .lock()
+            .expect("lock")
+            .read_buf
+            .extend_from_slice(&vec![0u8; READ_BUF_HIGH_WATER]);
+
+        assert!(!driver.read_buf_has_room(), "a full buffer does not");
+
+        // Park on the resume future, then let a reader take the bytes out.
+        let waiter = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move { ReadBufDrained::new(&shared).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "it should still be waiting");
+
+        let mut stream = crate::stream::RdpeudpStream::new(Arc::clone(&shared));
+        let mut buf = vec![0u8; READ_BUF_HIGH_WATER];
+        tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+            .await
+            .expect("read");
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the driver was never told the buffer drained")
+            .expect("join");
+
+        assert!(driver.read_buf_has_room());
     }
 
     /// Anything the peer can put on the wire is droppable; our own state

@@ -92,6 +92,46 @@ pub struct UdpAcceptConfig {
 // UdpTransport
 // ════════════════════════════════════════════════════════════════════
 
+/// A spawned task that is aborted if its handle is dropped without being
+/// taken back.
+///
+/// Dropping a bare `JoinHandle` detaches the task rather than stopping it, so
+/// every early return between spawning the driver and handing it to the caller
+/// used to leave it running: still holding the UDP socket, still arming
+/// timers, still answering keep-alives, for the life of the process. Wrapping
+/// the handle makes each `?` clean up on the way out instead of relying on
+/// every path remembering to.
+struct AbortOnDrop<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Take the handle back so it can be awaited instead of aborted.
+    fn take(&mut self) -> Option<JoinHandle<T>> {
+        self.0.take()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    /// Take the handle back only if the task has already ended, so the result
+    /// can be inspected rather than discarded.
+    fn take_if_finished(&mut self) -> Option<JoinHandle<T>> {
+        if self.is_finished() { self.0.take() } else { None }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
 /// Handle to an established UDP transport.
 ///
 /// Provides bidirectional higher-layer data (DVC frames) over the
@@ -112,10 +152,10 @@ pub struct UdpTransport {
     shared: Arc<Mutex<SharedIo>>,
 
     /// Handle to the UDP driver task (RDPEUDP2 I/O loop).
-    driver_handle: JoinHandle<Result<(), DriverError>>,
+    driver_handle: AbortOnDrop<Result<(), DriverError>>,
 
     /// Handle to the data pump task (TLS read → RDPEMT decode → channel).
-    pump_handle: JoinHandle<Result<(), UdpTransportError>>,
+    pump_handle: AbortOnDrop<Result<(), UdpTransportError>>,
 }
 
 impl UdpTransport {
@@ -143,7 +183,7 @@ impl UdpTransport {
     /// both the driver (exits the select! loop) and the read pump
     /// (gets EOF from the TLS stream). Then waits for both background
     /// tasks to complete.
-    pub async fn shutdown(self) -> Result<(), UdpTransportError> {
+    pub async fn shutdown(mut self) -> Result<(), UdpTransportError> {
         // Drop the send channel to signal the write pump to stop
         drop(self.data_tx);
         drop(self.data_rx);
@@ -165,15 +205,21 @@ impl UdpTransport {
         }
 
         // Wait for the pump task (should now get EOF and exit)
-        match self.pump_handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_join_err) => return Err(UdpTransportError::driver_panic("shutdown")),
+        if let Some(pump) = self.pump_handle.take() {
+            match pump.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_join_err) => return Err(UdpTransportError::driver_panic("shutdown")),
+            }
         }
 
         // Abort the driver (it may still be running the select! loop)
-        self.driver_handle.abort();
-        match self.driver_handle.await {
+        let Some(driver) = self.driver_handle.take() else {
+            return Ok(());
+        };
+
+        driver.abort();
+        match driver.await {
             Ok(Ok(())) | Err(_) => Ok(()),
             Ok(Err(e)) if matches!(e.kind(), DriverErrorKind::ConnectionClosed) => Ok(()),
             Ok(Err(e)) => Err(UdpTransportError::driver("shutdown", e)),
@@ -195,8 +241,8 @@ impl UdpTransport {
             data_rx,
             data_tx,
             shared: Arc::new(Mutex::new(SharedIo::new())),
-            driver_handle: tokio::spawn(async { Ok(()) }),
-            pump_handle: tokio::spawn(async { Ok(()) }),
+            driver_handle: AbortOnDrop::new(tokio::spawn(async { Ok(()) })),
+            pump_handle: AbortOnDrop::new(tokio::spawn(async { Ok(()) })),
         }
     }
 }
@@ -256,19 +302,20 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
     let driver = Driver::new(socket, conn, Arc::clone(&shared), Arc::clone(&connected_notify));
 
     // Spawn the driver task (it immediately sends the SYN packet)
-    let driver_handle = tokio::spawn(async move { driver.run().await });
+    // Guarded from here on, so the TLS and tunnel steps below abort the driver
+    // if they fail rather than detaching it.
+    let mut driver_handle = AbortOnDrop::new(tokio::spawn(async move { driver.run().await }));
 
     // Wait for the RDPEUDP2 handshake to complete (Event::Connected)
     let handshake_result = tokio::time::timeout(config.handshake_timeout, connected_notify.notified()).await;
 
     if handshake_result.is_err() {
-        driver_handle.abort();
         return Err(UdpTransportError::handshake_timeout("connect udp"));
     }
 
     // Check if driver died during handshake
-    if driver_handle.is_finished() {
-        return match driver_handle.await {
+    if let Some(driver) = driver_handle.take_if_finished() {
+        return match driver.await {
             Ok(Ok(())) => Err(UdpTransportError::handshake(
                 "connect udp",
                 DriverError::connection_closed("connect udp"),
@@ -303,7 +350,9 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(64);
 
     // Read pump: TLS → RDPEMT decode → channel
-    let pump_handle = tokio::spawn(async move { tunnel_data_loop(&mut tls_read, &mut tunnel, &incoming_tx).await });
+    let pump_handle = AbortOnDrop::new(tokio::spawn(async move {
+        tunnel_data_loop(&mut tls_read, &mut tunnel, &incoming_tx).await
+    }));
 
     // Write pump: channel → RDPEMT encode → TLS
     tokio::spawn(async move {
@@ -422,13 +471,15 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
     let connected_notify = Arc::new(Notify::new());
 
     let driver = Driver::new(socket, conn, Arc::clone(&shared), Arc::clone(&connected_notify));
-    let driver_handle = tokio::spawn(async move { driver.run().await });
+    // Guarded from here on, so the TLS and tunnel steps below abort the driver
+    // if they fail rather than detaching it.
+    let mut driver_handle = AbortOnDrop::new(tokio::spawn(async move { driver.run().await }));
 
     // Wait for the RDPEUDP2 handshake to complete (ACK received)
     connected_notify.notified().await;
 
-    if driver_handle.is_finished() {
-        return match driver_handle.await {
+    if let Some(driver) = driver_handle.take_if_finished() {
+        return match driver.await {
             Ok(Ok(())) => Err(UdpTransportError::handshake(
                 "accept udp inner",
                 DriverError::connection_closed("accept udp inner"),
@@ -459,7 +510,9 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
     let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(64);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(64);
 
-    let pump_handle = tokio::spawn(async move { tunnel_data_loop(&mut tls_read, &mut tunnel, &incoming_tx).await });
+    let pump_handle = AbortOnDrop::new(tokio::spawn(async move {
+        tunnel_data_loop(&mut tls_read, &mut tunnel, &incoming_tx).await
+    }));
 
     tokio::spawn(async move {
         write_pump(&mut tls_write, &mut outgoing_rx).await;
@@ -553,4 +606,97 @@ where
 /// cryptographic dependency.
 fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
     Sha256::digest(tunnel_config.security_cookie).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    /// Dropping the guard stops the task rather than detaching it.
+    ///
+    /// A bare `JoinHandle` detaches on drop, so every early return between
+    /// spawning the driver and returning a `UdpTransport` used to leave it
+    /// running with the socket, the timers and the keep-alives.
+    #[tokio::test]
+    async fn the_guard_aborts_a_task_it_still_owns() {
+        static STILL_RUNNING: AtomicBool = AtomicBool::new(false);
+        STILL_RUNNING.store(false, Ordering::SeqCst);
+
+        let guard = AbortOnDrop::new(tokio::spawn(async {
+            loop {
+                STILL_RUNNING.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(STILL_RUNNING.load(Ordering::SeqCst), "the task should have started");
+
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        STILL_RUNNING.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            !STILL_RUNNING.load(Ordering::SeqCst),
+            "the task outlived the guard that owned it"
+        );
+    }
+
+    /// Taking the handle back disarms the guard, so a task that is about to be
+    /// awaited is not killed underneath the caller.
+    #[tokio::test]
+    async fn taking_the_handle_back_disarms_the_guard() {
+        let mut guard = AbortOnDrop::new(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            7u8
+        }));
+
+        let handle = guard.take().expect("the handle is still there");
+        drop(guard);
+
+        assert_eq!(handle.await.expect("the task should not have been aborted"), 7);
+    }
+
+    /// Dropping a `UdpTransport` stops its background tasks. Without this the
+    /// driver keeps the socket open and keeps answering keep-alives for the
+    /// life of the process.
+    #[tokio::test]
+    async fn dropping_the_transport_stops_its_tasks() {
+        static DRIVER_RUNNING: AtomicBool = AtomicBool::new(false);
+        DRIVER_RUNNING.store(false, Ordering::SeqCst);
+
+        let (_incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel::<Vec<u8>>(4);
+
+        let transport = UdpTransport {
+            data_rx: incoming_rx,
+            data_tx: outgoing_tx,
+            shared: Arc::new(Mutex::new(SharedIo::new())),
+            driver_handle: AbortOnDrop::new(tokio::spawn(async {
+                loop {
+                    DRIVER_RUNNING.store(true, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })),
+            pump_handle: AbortOnDrop::new(tokio::spawn(async { Ok(()) })),
+        };
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(DRIVER_RUNNING.load(Ordering::SeqCst));
+
+        drop(transport);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        DRIVER_RUNNING.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            !DRIVER_RUNNING.load(Ordering::SeqCst),
+            "the driver outlived the transport that owned it"
+        );
+    }
 }

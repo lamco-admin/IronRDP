@@ -47,6 +47,13 @@ pub(crate) struct SharedIo {
     /// trigger conditions (data-present vs data-drained).
     pub(crate) flush_waker: Option<Waker>,
 
+    /// Waker registered by the driver when `read_buf` has grown past what it
+    /// is willing to hold. Fired by `poll_read` once it has taken bytes out.
+    ///
+    /// Without it the driver has no way to learn that the consumer caught up,
+    /// and would sit throttled until some unrelated timer happened to fire.
+    pub(crate) read_drained_waker: Option<Waker>,
+
     /// Fatal error from the driver (propagated to reads/writes).
     pub(crate) error: Option<io::ErrorKind>,
 
@@ -62,6 +69,7 @@ impl SharedIo {
             write_buf: BytesMut::with_capacity(8192),
             write_waker: None,
             flush_waker: None,
+            read_drained_waker: None,
             error: None,
             closed: false,
         }
@@ -97,6 +105,13 @@ impl AsyncRead for RdpeudpStream {
         if !shared.read_buf.is_empty() {
             let n = core::cmp::min(buf.remaining(), shared.read_buf.len());
             buf.put_slice(&shared.read_buf.split_to(n));
+
+            // Tell the driver it has room again, in case it stopped taking
+            // packets off the socket while this buffer was full.
+            if let Some(waker) = shared.read_drained_waker.take() {
+                waker.wake();
+            }
+
             return Poll::Ready(Ok(()));
         }
 
