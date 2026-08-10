@@ -76,11 +76,19 @@ const V1_STANDALONE_FLAGS: u16 = V1Flags::FIN.bits()
 ///
 /// Wire payload ordering (per MS-RDPEUDP Section 2.2.2):
 /// 1. FecHeader (mandatory, 8 bytes)
-/// 2. V1AckVectorHeader (if ACK flag)
+/// 2. V1AckVectorHeader (if ACK flag and not SYN, see below)
 /// 3. V1AckOfAcksHeader (if ACK_OF_ACKS flag)
 /// 4. SynDataPayload (if SYN flag)
 /// 5. CorrelationIdPayload (if CORRELATION_ID flag)
 /// 6. SynDataExPayload (if SYNEX flag)
+///
+/// A SYN+ACK is the exception to the ACK flag's usual meaning. Section
+/// 2.2.2.1 defines the flag as "the ACK vector is present", but 3.1.5.1.3
+/// builds the SYN+ACK as a plain SYN with the ACK flag set and snSourceAck
+/// filled in, and nothing else. The capture in section 4.1.2 confirms it:
+/// uFlags is 0x0005 (SYN | ACK) and the SYNDATA payload follows the header
+/// directly, with no ACK vector between them. So on a SYN+ACK the flag says
+/// only that snSourceAck is meaningful, and `ack_vector` must be `None`.
 ///
 /// V1 data payloads (SOURCE_PAYLOAD / FEC_PAYLOAD) are not represented;
 /// this crate always negotiates v2+ for data transfer.
@@ -91,7 +99,8 @@ pub struct V1Datagram {
     pub header: FecHeader,
 
     /// ACK vector (run-length encoded receiver state).
-    /// Gated by `V1Flags::ACK`.
+    /// Gated by `V1Flags::ACK`, except on a SYN+ACK, which sets that flag
+    /// without carrying a vector. Must be `None` whenever `syn_data` is set.
     pub ack_vector: Option<V1AckVectorHeader>,
 
     /// AckOfAcks (resets ACK vector encoding base).
@@ -126,6 +135,10 @@ impl V1Datagram {
         }
         if self.syn_data.is_some() {
             flags |= V1Flags::SYN;
+            // On a SYN+ACK the ACK flag has no payload to be derived from,
+            // so take it from the caller. Section 3.1.5.1.3 requires it to
+            // be set on the server's half of the handshake.
+            flags |= self.header.flags & V1Flags::ACK;
         }
         if self.correlation_id.is_some() {
             flags |= V1Flags::CORRELATION_ID;
@@ -140,6 +153,17 @@ impl V1Datagram {
 
 impl Encode for V1Datagram {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        // A SYN+ACK carries no ACK vector (3.1.5.1.3, capture in 4.1.2), and
+        // a receiver keying off the SYN flag would read whatever we wrote here
+        // as the start of the SYNDATA payload.
+        if self.syn_data.is_some() && self.ack_vector.is_some() {
+            return Err(ironrdp_core::invalid_field_err!(
+                Self::NAME,
+                "ack_vector",
+                "a SYN datagram cannot carry an ACK vector"
+            ));
+        }
+
         ironrdp_core::ensure_size!(in: dst, size: self.size());
 
         // Write header with auto-computed flags
@@ -215,8 +239,12 @@ impl Decode<'_> for V1Datagram {
             ));
         }
 
-        // Decode payloads in spec-mandated order, gated by flags
-        let ack_vector = if header.flags.contains(V1Flags::ACK) {
+        // Decode payloads in spec-mandated order, gated by flags.
+        //
+        // SYN suppresses the ACK vector: on a SYN+ACK the ACK flag marks
+        // snSourceAck as meaningful rather than announcing a vector. See the
+        // note on `V1Datagram`.
+        let ack_vector = if header.flags.contains(V1Flags::ACK) && !header.flags.contains(V1Flags::SYN) {
             Some(V1AckVectorHeader::decode(src)?)
         } else {
             None

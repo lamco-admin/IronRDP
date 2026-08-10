@@ -19,7 +19,9 @@ bitflags! {
         /// FIN: connection teardown (currently unused by the spec).
         const FIN = 0x0002;
 
-        /// ACK: `RDPUDP_ACK_VECTOR_HEADER` is present.
+        /// ACK: `RDPUDP_ACK_VECTOR_HEADER` is present, except on a SYN+ACK
+        /// (section 3.1.5.1.3), where it marks snSourceAck as meaningful and
+        /// no vector follows.
         const ACK = 0x0004;
 
         /// DATA: `RDPUDP_SOURCE_PAYLOAD_HEADER` or

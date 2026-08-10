@@ -38,7 +38,9 @@ fn v1_syn_datagram_roundtrip() {
     assert_eq!(decoded, datagram);
 }
 
-/// Server SYN+ACK: header + ack_vector + SYNDATA + SYNDATAEX.
+/// Server SYN+ACK: header + SYNDATA + SYNDATAEX.
+///
+/// No ACK vector, despite the ACK flag: see [MS-RDPEUDP] 3.1.5.1.3.
 #[test]
 fn v1_syn_ack_datagram_roundtrip() {
     let datagram = V1Datagram {
@@ -47,12 +49,7 @@ fn v1_syn_ack_datagram_roundtrip() {
             receive_window_size: 64,
             flags: V1Flags::SYN | V1Flags::ACK | V1Flags::SYNEX,
         },
-        ack_vector: Some(V1AckVectorHeader {
-            elements: vec![V1AckVectorElement {
-                state: VectorElementState::DatagramReceived,
-                length: 1,
-            }],
-        }),
+        ack_vector: None,
         ack_of_acks: None,
         syn_data: Some(SynDataPayload {
             initial_sequence_number: 0xAABB_CCDD,
@@ -67,13 +64,107 @@ fn v1_syn_ack_datagram_roundtrip() {
         }),
     };
 
-    // header(8) + ack_vector(2 + 1 element + 1 pad = 4) + syndata(8) + syndataex(4) = 24.
-    // The ACK vector pads to a DWORD boundary, per [MS-RDPEUDP] 2.2.2.7.
-    assert_eq!(datagram.size(), 24);
+    // header(8) + syndata(8) + syndataex(4) = 20.
+    assert_eq!(datagram.size(), 20);
 
     let encoded = encode_vec(&datagram).expect("encode");
     let decoded: V1Datagram = decode(&encoded).expect("decode");
     assert_eq!(decoded, datagram);
+    assert!(decoded.header.flags.contains(V1Flags::ACK));
+}
+
+/// The SYN+ACK capture from [MS-RDPEUDP] 4.1.2, decoded whole.
+///
+/// The ACK flag is set and the SYNDATA payload starts immediately after the
+/// 8-byte header, so a decoder that reads an ACK vector here consumes the
+/// first half of SYNDATA and desynchronises for the rest of the datagram.
+#[test]
+fn v1_decode_the_spec_syn_ack_capture() {
+    // Trailing zeroes are the start of the pad to uUpStreamMtu.
+    const CAPTURE: [u8; 19] = [
+        0x00, 0x00, 0x00, 0x42, 0x04, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x42, 0x04, 0xD0, 0x04, 0xD0, 0x00, 0x00,
+        0x00,
+    ];
+
+    let datagram: V1Datagram = decode(&CAPTURE).expect("decode");
+
+    assert_eq!(datagram.header.sn_source_ack, 0x42);
+    assert_eq!(datagram.header.receive_window_size, 1024);
+    assert_eq!(datagram.header.flags, V1Flags::SYN | V1Flags::ACK);
+    assert!(datagram.ack_vector.is_none());
+
+    let syn_data = datagram.syn_data.expect("SYNDATA");
+    assert_eq!(syn_data.initial_sequence_number, 0x42);
+    assert_eq!(syn_data.upstream_mtu, 1232);
+    assert_eq!(syn_data.downstream_mtu, 1232);
+
+    assert!(datagram.syn_data_ex.is_none());
+}
+
+/// The ACK capture from [MS-RDPEUDP] 4.2.3, whose vector we do decode.
+///
+/// The counterpart to the SYN+ACK above: without SYN, the ACK flag means what
+/// 2.2.2.1 says it means. The DATA payload is left off, since v1 data transfer
+/// is out of scope for this crate.
+#[test]
+fn v1_decode_the_spec_ack_capture() {
+    const CAPTURE: [u8; 16] = [
+        // FEC header: snSourceAck, uReceiveWindowSize 1024, uFlags 0x0104.
+        0xD6, 0xCF, 0x0A, 0xB8, 0x04, 0x00, 0x01, 0x04,
+        // ACK vector: one element, 4 datagrams received, then a pad byte.
+        0x00, 0x01, 0x04, 0x00, //
+        // AckOfAcks.
+        0xD6, 0xCF, 0x0A, 0xB8,
+    ];
+
+    let datagram: V1Datagram = decode(&CAPTURE).expect("decode");
+
+    assert_eq!(datagram.header.sn_source_ack, 0xD6CF_0AB8);
+    assert_eq!(datagram.header.receive_window_size, 1024);
+
+    let ack_vector = datagram.ack_vector.as_ref().expect("ACK vector");
+    assert_eq!(
+        ack_vector.elements,
+        vec![V1AckVectorElement {
+            state: VectorElementState::DatagramReceived,
+            length: 4,
+        }]
+    );
+
+    assert_eq!(
+        datagram.ack_of_acks.as_ref().expect("AckOfAcks").reset_seq_num,
+        0xD6CF_0AB8
+    );
+
+    assert_eq!(encode_vec(&datagram).expect("encode"), CAPTURE);
+}
+
+/// A SYN datagram carrying an ACK vector is rejected rather than written.
+#[test]
+fn v1_encode_rejects_ack_vector_on_a_syn() {
+    let datagram = V1Datagram {
+        header: FecHeader {
+            sn_source_ack: 100,
+            receive_window_size: 64,
+            flags: V1Flags::SYN | V1Flags::ACK,
+        },
+        ack_vector: Some(V1AckVectorHeader {
+            elements: vec![V1AckVectorElement {
+                state: VectorElementState::DatagramReceived,
+                length: 1,
+            }],
+        }),
+        ack_of_acks: None,
+        syn_data: Some(SynDataPayload {
+            initial_sequence_number: 1,
+            upstream_mtu: 1232,
+            downstream_mtu: 1232,
+        }),
+        correlation_id: None,
+        syn_data_ex: None,
+    };
+
+    encode_vec(&datagram).expect_err("a SYN datagram cannot carry an ACK vector");
 }
 
 /// Client final ACK: header + ack_vector + ack_of_acks.
@@ -187,16 +278,13 @@ fn v1_flags_auto_computed_on_encode() {
         header: FecHeader {
             sn_source_ack: 0xFFFF_FFFF,
             receive_window_size: 64,
-            // Caller only set SYN, but ack_vector is also populated
-            flags: V1Flags::SYN,
+            // Caller set neither ACK nor ACK_OF_ACKS, but the payloads
+            // those flags gate are populated.
+            flags: V1Flags::empty(),
         },
         ack_vector: Some(V1AckVectorHeader { elements: vec![] }),
-        ack_of_acks: None,
-        syn_data: Some(SynDataPayload {
-            initial_sequence_number: 1,
-            upstream_mtu: 1232,
-            downstream_mtu: 1232,
-        }),
+        ack_of_acks: Some(V1AckOfAcksHeader { reset_seq_num: 7 }),
+        syn_data: None,
         correlation_id: None,
         // syn_data_ex is None, so SYNEX should NOT be in flags
         syn_data_ex: None,
@@ -207,10 +295,63 @@ fn v1_flags_auto_computed_on_encode() {
 
     // ACK should be auto-added (ack_vector is Some)
     assert!(decoded.header.flags.contains(V1Flags::ACK));
-    // SYN should be present (syn_data is Some)
-    assert!(decoded.header.flags.contains(V1Flags::SYN));
+    // ACK_OF_ACKS should be auto-added (ack_of_acks is Some)
+    assert!(decoded.header.flags.contains(V1Flags::ACK_OF_ACKS));
     // SYNEX should NOT be set (syn_data_ex is None)
     assert!(!decoded.header.flags.contains(V1Flags::SYNEX));
+}
+
+/// The ACK flag survives on a SYN+ACK, where no payload implies it.
+#[test]
+fn v1_ack_flag_preserved_on_a_syn() {
+    let datagram = V1Datagram {
+        header: FecHeader {
+            sn_source_ack: 100,
+            receive_window_size: 64,
+            flags: V1Flags::ACK,
+        },
+        ack_vector: None,
+        ack_of_acks: None,
+        syn_data: Some(SynDataPayload {
+            initial_sequence_number: 1,
+            upstream_mtu: 1232,
+            downstream_mtu: 1232,
+        }),
+        correlation_id: None,
+        syn_data_ex: None,
+    };
+
+    let encoded = encode_vec(&datagram).expect("encode");
+    let decoded: V1Datagram = decode(&encoded).expect("decode");
+
+    assert_eq!(decoded.header.flags, V1Flags::SYN | V1Flags::ACK);
+    assert!(decoded.ack_vector.is_none());
+}
+
+/// A plain SYN does not acquire the ACK flag.
+#[test]
+fn v1_ack_flag_absent_on_a_bare_syn() {
+    let datagram = V1Datagram {
+        header: FecHeader {
+            sn_source_ack: 0xFFFF_FFFF,
+            receive_window_size: 64,
+            flags: V1Flags::empty(),
+        },
+        ack_vector: None,
+        ack_of_acks: None,
+        syn_data: Some(SynDataPayload {
+            initial_sequence_number: 1,
+            upstream_mtu: 1232,
+            downstream_mtu: 1232,
+        }),
+        correlation_id: None,
+        syn_data_ex: None,
+    };
+
+    let encoded = encode_vec(&datagram).expect("encode");
+    let decoded: V1Datagram = decode(&encoded).expect("decode");
+
+    assert_eq!(decoded.header.flags, V1Flags::SYN);
 }
 
 /// Standalone flags (CN, CWR, ACKDELAYED) are preserved on encode.

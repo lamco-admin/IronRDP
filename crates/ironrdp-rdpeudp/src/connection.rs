@@ -582,12 +582,9 @@ impl RdpeudpConnection {
                 receive_window_size: 1u16 << u16::from(self.config.log_window_size),
                 flags: V1Flags::SYN | V1Flags::ACK | V1Flags::SYNEX,
             },
-            ack_vector: Some(V1AckVectorHeader {
-                elements: vec![V1AckVectorElement {
-                    state: VectorElementState::DatagramReceived,
-                    length: 1,
-                }],
-            }),
+            // A SYN+ACK acknowledges the client's SYN through snSourceAck
+            // alone (3.1.5.1.3); no ACK vector goes on the wire.
+            ack_vector: None,
             ack_of_acks: None,
             syn_data: Some(SynDataPayload {
                 initial_sequence_number: self.config.initial_sequence_number,
