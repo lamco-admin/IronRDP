@@ -179,8 +179,10 @@ async fn tunnel_rejection_mismatched_cookie() {
 
     let (server_result, client_result) = tokio::join!(server_handle, client_handle);
 
-    // At least one side should fail -- the server rejects the mismatched cookie
-    // and sends a failure CreateResponse, which the client receives.
+    // The mismatch is now caught during the RDPEUDP handshake rather than at
+    // the tunnel: the client's SYN carries the SHA-256 of its cookie
+    // ([MS-RDPEUDP] 2.2.2.9) and the server compares it against its own, so an
+    // unauthenticated peer never reaches the TLS handshake.
     let server_err = server_result.expect("server join").is_err();
     let client_err = client_result.expect("client join").is_err();
 

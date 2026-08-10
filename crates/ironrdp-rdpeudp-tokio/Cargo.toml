@@ -24,6 +24,7 @@ ironrdp-rdpemt = { path = "../ironrdp-rdpemt", version = "0.1", features = ["std
 ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", version = "0.1", features = ["std"] } # public
 bytes = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] } # public
+sha2 = "0.10"
 # Mirrors `ironrdp-tls`: rustls is reached through `tokio_rustls::rustls` rather
 # than declared separately. The crypto provider is not bundled, so the process
 # default must be installed before connecting.

@@ -308,6 +308,15 @@ mod tests {
     use core::time::Duration;
 
     use ironrdp_rdpeudp::ConnectionConfig;
+
+    /// `connect` requires the cookie hash a version 3 SYN carries. These tests
+    /// never reach a real multitransport request, so any value will do.
+    fn test_connection_config() -> ConnectionConfig {
+        ConnectionConfig {
+            cookie_hash: Some([0x5A; 32]),
+            ..ConnectionConfig::default()
+        }
+    }
     use ironrdp_rdpeudp::RdpeudpErrorExt as _;
 
     use super::*;
@@ -321,8 +330,7 @@ mod tests {
         let server_addr = server_sock.local_addr().expect("server addr");
         client_sock.connect(server_addr).await.expect("connect");
 
-        let config = ConnectionConfig::default();
-        let conn = RdpeudpConnection::connect(config, Clock::new().now());
+        let conn = RdpeudpConnection::connect(test_connection_config(), Clock::new().now()).expect("connect");
 
         let shared = Arc::new(Mutex::new(SharedIo::new()));
         let notify = Arc::new(Notify::new());
@@ -357,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn an_error_exit_wakes_a_parked_reader() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
-        let conn = RdpeudpConnection::connect(ConnectionConfig::default(), Clock::new().now());
+        let conn = RdpeudpConnection::connect(test_connection_config(), Clock::new().now()).expect("connect");
 
         let shared = Arc::new(Mutex::new(SharedIo::new()));
         let woken = Arc::new(core::sync::atomic::AtomicBool::new(false));

@@ -1,5 +1,5 @@
 use core::time::Duration;
-use ironrdp_core::decode;
+use ironrdp_core::{decode, encode_vec};
 use ironrdp_rdpeudp::pdu::*;
 use ironrdp_rdpeudp::*;
 fn now() -> MonotonicInstant {
@@ -10,6 +10,10 @@ fn later(base: MonotonicInstant, ms: u64) -> MonotonicInstant {
     base + Duration::from_millis(ms)
 }
 
+/// Stand-in for the SHA-256 of a security cookie. Both ends of a test use the
+/// same one, which is what a real client and server would also have.
+const TEST_COOKIE_HASH: [u8; 32] = [0x5A; 32];
+
 fn default_config(isn: u32) -> ConnectionConfig {
     ConnectionConfig {
         initial_sequence_number: isn,
@@ -19,6 +23,17 @@ fn default_config(isn: u32) -> ConnectionConfig {
         idle_timeout: Duration::from_secs(65),
         keep_alive_interval: Duration::from_secs(8),
         ack_delay_timeout: Duration::from_millis(50),
+        cookie_hash: Some(TEST_COOKIE_HASH),
+    }
+}
+
+/// A client SYN as `connect` builds it, for tests that drive the server side
+/// by hand.
+fn test_syn_data_ex() -> SynDataExPayload {
+    SynDataExPayload {
+        syn_ex_flags: SynExFlags::VERSION_INFO_VALID,
+        udp_ver: UdpVersion::V3,
+        cookie_hash: Some(TEST_COOKIE_HASH),
     }
 }
 
@@ -27,7 +42,7 @@ fn default_config(isn: u32) -> ConnectionConfig {
 #[test]
 fn client_connect_produces_syn() {
     let t = now();
-    let mut conn = RdpeudpConnection::connect(default_config(100), t);
+    let mut conn = RdpeudpConnection::connect(default_config(100), t).expect("connect");
 
     let transmit = conn.poll_transmit(t).expect("should have SYN");
     assert!(!transmit.contents.is_empty());
@@ -72,11 +87,7 @@ fn server_accept_produces_syn_ack() {
             downstream_mtu: 1232,
         }),
         correlation_id: None,
-        syn_data_ex: Some(SynDataExPayload {
-            syn_ex_flags: SynExFlags::VERSION_INFO_VALID,
-            udp_ver: UdpVersion::V2,
-            cookie_hash: None,
-        }),
+        syn_data_ex: Some(test_syn_data_ex()),
     };
 
     let mut conn = RdpeudpConnection::accept(default_config(200), &client_syn, t).expect("accept");
@@ -103,7 +114,7 @@ fn full_handshake_client_server() {
     let t = now();
 
     // Step 1: Client sends SYN
-    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
     let syn_transmit = client.poll_transmit(t).expect("client SYN");
 
     // Step 2: Server receives SYN and creates connection with SYN+ACK
@@ -170,7 +181,7 @@ fn server_rejects_non_v2_syn() {
 #[test]
 fn send_before_established_returns_error() {
     let t = now();
-    let mut conn = RdpeudpConnection::connect(default_config(100), t);
+    let mut conn = RdpeudpConnection::connect(default_config(100), t).expect("connect");
 
     let result = conn.send(vec![0xAA; 100]);
     assert!(matches!(result.unwrap_err().kind(), RdpeudpErrorKind::InvalidState));
@@ -182,7 +193,7 @@ fn send_before_established_returns_error() {
 fn establish_pair() -> (RdpeudpConnection, RdpeudpConnection, MonotonicInstant) {
     let t = now();
 
-    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
     let syn = client.poll_transmit(t).expect("SYN");
 
     let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
@@ -430,7 +441,7 @@ fn debug_impl() {
 #[test]
 fn idle_close_leaves_no_timer_armed() {
     let mut now = MonotonicInstant::from_millis(0);
-    let mut conn = RdpeudpConnection::connect(default_config(100), now);
+    let mut conn = RdpeudpConnection::connect(default_config(100), now).expect("connect");
     while conn.poll_transmit(now).is_some() {}
 
     // Walk past the keep-alive interval so that timer is armed and due in the
@@ -468,7 +479,7 @@ fn closed_connection_transmits_nothing_and_arms_nothing() {
     let now = MonotonicInstant::from_millis(0);
 
     // Close while the SYN is still queued, which is the state the oracle found.
-    let mut conn = RdpeudpConnection::connect(default_config(100), now);
+    let mut conn = RdpeudpConnection::connect(default_config(100), now).expect("connect");
     conn.close();
 
     assert!(
@@ -501,7 +512,7 @@ fn advance_to_retransmit(conn: &mut RdpeudpConnection) -> Option<Vec<u8>> {
 #[test]
 fn unanswered_syn_is_retransmitted() {
     let t = now();
-    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
 
     let first = client.poll_transmit(t).expect("SYN");
     let again = advance_to_retransmit(&mut client).expect("SYN again");
@@ -514,7 +525,7 @@ fn unanswered_syn_is_retransmitted() {
 fn unanswered_syn_ack_is_retransmitted() {
     let t = now();
 
-    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
     let syn = client.poll_transmit(t).expect("SYN");
     let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
 
@@ -529,7 +540,7 @@ fn unanswered_syn_ack_is_retransmitted() {
 #[test]
 fn a_syn_that_is_never_answered_closes_the_connection() {
     let t = now();
-    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
     client.poll_transmit(t).expect("SYN");
 
     // The retransmit timer keeps firing until the limit is reached. The idle
@@ -561,7 +572,7 @@ fn client_idle_timeout() -> Duration {
 fn a_repeated_syn_draws_another_syn_ack() {
     let t = now();
 
-    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
     let syn = client.poll_transmit(t).expect("SYN");
     let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
 
@@ -583,7 +594,7 @@ fn a_repeated_syn_draws_another_syn_ack() {
 fn a_repeated_syn_ack_draws_another_final_ack() {
     let t = now();
 
-    let mut client = RdpeudpConnection::connect(default_config(100), t);
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
     let syn = client.poll_transmit(t).expect("SYN");
     let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
 
@@ -801,4 +812,153 @@ fn an_acknowledgement_produces_an_rtt_sample() {
     let srtt = client.srtt().expect("an RTT sample");
     assert_eq!(srtt, Duration::from_millis(80));
     assert_ne!(client.rto(), initial_rto, "the RTO should follow the estimate");
+}
+
+// ── Protocol version negotiation ──
+//
+// [MS-RDPEUDP] 1.3.2.2: the MS-RDPEUDP data transfer messages "MUST be used
+// only when the version negotiated in the UDP connection initialization phase
+// is version 1 or version 2". Only version 3 reaches MS-RDPEUDP2, which is the
+// data transfer this crate implements, so version 3 is the only value it can
+// honestly advertise or accept.
+
+fn syn_data_ex_of(transmit: &Transmit) -> SynDataExPayload {
+    let datagram: V1Datagram = decode(&transmit.contents).expect("decode");
+    datagram.syn_data_ex.expect("SYNDATAEX")
+}
+
+#[test]
+fn the_syn_advertises_version_3_with_the_cookie_hash() {
+    let t = now();
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
+
+    let syn = client.poll_transmit(t).expect("SYN");
+    let syn_data_ex = syn_data_ex_of(&syn);
+
+    assert_eq!(syn_data_ex.udp_ver, UdpVersion::V3);
+    assert_eq!(
+        syn_data_ex.cookie_hash,
+        Some(TEST_COOKIE_HASH),
+        "[MS-RDPEUDP] 2.2.2.9 requires the hash alongside version 3"
+    );
+}
+
+#[test]
+fn the_syn_ack_advertises_version_3_without_a_cookie_hash() {
+    let t = now();
+
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
+    let syn = client.poll_transmit(t).expect("SYN");
+    let syn_dg: V1Datagram = decode(&syn.contents).expect("decode SYN");
+
+    let mut server = RdpeudpConnection::accept(default_config(200), &syn_dg, t).expect("accept");
+    let syn_ack = server.poll_transmit(t).expect("SYN+ACK");
+    let syn_data_ex = syn_data_ex_of(&syn_ack);
+
+    assert_eq!(syn_data_ex.udp_ver, UdpVersion::V3);
+    assert_eq!(
+        syn_data_ex.cookie_hash, None,
+        "2.2.2.9: the hash belongs in the client's SYN and \"MUST NOT be present in any other case\""
+    );
+}
+
+#[test]
+fn connect_refuses_to_build_a_version_3_syn_without_a_cookie_hash() {
+    let config = ConnectionConfig {
+        cookie_hash: None,
+        ..default_config(100)
+    };
+
+    RdpeudpConnection::connect(config, now()).expect_err("a version 3 SYN must carry the hash");
+}
+
+#[test]
+fn a_server_rejects_a_syn_offering_a_version_below_3() {
+    let t = now();
+
+    let syn = V1Datagram {
+        header: FecHeader {
+            sn_source_ack: 0xFFFF_FFFF,
+            receive_window_size: 64,
+            flags: V1Flags::SYN | V1Flags::SYNEX,
+        },
+        ack_vector: None,
+        ack_of_acks: None,
+        syn_data: Some(SynDataPayload {
+            initial_sequence_number: 100,
+            upstream_mtu: 1232,
+            downstream_mtu: 1232,
+        }),
+        correlation_id: None,
+        syn_data_ex: Some(SynDataExPayload {
+            syn_ex_flags: SynExFlags::VERSION_INFO_VALID,
+            // 0x0002 means the MS-RDPEUDP data transfer, not MS-RDPEUDP2.
+            udp_ver: UdpVersion::V2,
+            cookie_hash: None,
+        }),
+    };
+
+    RdpeudpConnection::accept(default_config(200), &syn, t).expect_err("version 2 is not RDPEUDP2");
+}
+
+#[test]
+fn a_server_rejects_a_syn_whose_cookie_hash_does_not_match() {
+    let t = now();
+
+    let syn = V1Datagram {
+        header: FecHeader {
+            sn_source_ack: 0xFFFF_FFFF,
+            receive_window_size: 64,
+            flags: V1Flags::SYN | V1Flags::SYNEX,
+        },
+        ack_vector: None,
+        ack_of_acks: None,
+        syn_data: Some(SynDataPayload {
+            initial_sequence_number: 100,
+            upstream_mtu: 1232,
+            downstream_mtu: 1232,
+        }),
+        correlation_id: None,
+        syn_data_ex: Some(SynDataExPayload {
+            syn_ex_flags: SynExFlags::VERSION_INFO_VALID,
+            udp_ver: UdpVersion::V3,
+            cookie_hash: Some([0xFF; 32]),
+        }),
+    };
+
+    RdpeudpConnection::accept(default_config(200), &syn, t).expect_err("the hash is for a different cookie");
+}
+
+#[test]
+fn a_client_rejects_a_syn_ack_that_settles_below_version_3() {
+    let t = now();
+    let mut client = RdpeudpConnection::connect(default_config(100), t).expect("connect");
+    client.poll_transmit(t).expect("SYN");
+
+    let syn_ack = V1Datagram {
+        header: FecHeader {
+            sn_source_ack: 100,
+            receive_window_size: 64,
+            flags: V1Flags::SYN | V1Flags::ACK | V1Flags::SYNEX,
+        },
+        ack_vector: None,
+        ack_of_acks: None,
+        syn_data: Some(SynDataPayload {
+            initial_sequence_number: 200,
+            upstream_mtu: 1232,
+            downstream_mtu: 1232,
+        }),
+        correlation_id: None,
+        syn_data_ex: Some(SynDataExPayload {
+            syn_ex_flags: SynExFlags::VERSION_INFO_VALID,
+            udp_ver: UdpVersion::V2,
+            cookie_hash: None,
+        }),
+    };
+
+    let mut bytes = encode_vec(&syn_ack).expect("encode");
+    client
+        .handle_datagram(&mut bytes, later(t, 50))
+        .expect_err("the server settled on the MS-RDPEUDP data transfer");
+    assert!(!client.is_established());
 }

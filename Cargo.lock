@@ -2925,6 +2925,7 @@ dependencies = [
  "ironrdp-error 0.2.0",
  "ironrdp-rdpemt",
  "ironrdp-rdpeudp",
+ "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
  "tracing",

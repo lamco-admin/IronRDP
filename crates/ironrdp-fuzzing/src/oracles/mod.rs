@@ -886,9 +886,17 @@ pub fn rdpeudp_connection(data: &[u8]) {
         return;
     };
 
-    let config = ConnectionConfig::default();
+    let config = ConnectionConfig {
+        // A version 3 SYN carries this, so `connect` requires it. The value
+        // is arbitrary here: the fuzzer drives the peer side, not the
+        // multitransport request the hash would really come from.
+        cookie_hash: Some([0u8; 32]),
+        ..ConnectionConfig::default()
+    };
     let mut now = MonotonicInstant::from_millis(0);
-    let mut conn = RdpeudpConnection::connect(config, now);
+    let Ok(mut conn) = RdpeudpConnection::connect(config, now) else {
+        return;
+    };
 
     let mut was_closed = false;
 

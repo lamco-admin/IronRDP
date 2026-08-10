@@ -120,6 +120,23 @@ pub struct ConnectionConfig {
     /// ACK delay timeout: maximum time to hold an ACK before sending it.
     /// Default: 50ms per MS-RDPEUDP2.
     pub ack_delay_timeout: Duration,
+
+    /// SHA-256 of the `securityCookie` from the Initiate Multitransport
+    /// Request PDU ([MS-RDPBCGR] 2.2.15.1).
+    ///
+    /// Required, despite being an `Option`: this crate implements the
+    /// MS-RDPEUDP2 data transfer, which [MS-RDPEUDP] 1.3.2.2 reaches only at
+    /// protocol version 3, and 2.2.2.9 requires the hash in a version 3 SYN.
+    /// A connection without it cannot be built, so [`RdpeudpConnection::connect`]
+    /// and [`RdpeudpConnection::accept`] both refuse one.
+    ///
+    /// The default is `None` because there is no meaningful value to invent.
+    /// Callers get the cookie from the multitransport request and hash it;
+    /// `ironrdp-rdpeudp-tokio` does this for them.
+    ///
+    /// The server holds the same value and compares it against the client's
+    /// SYN, which is the check 3.1.5.1.1 asks of it.
+    pub cookie_hash: Option<[u8; 32]>,
 }
 
 impl Default for ConnectionConfig {
@@ -132,6 +149,7 @@ impl Default for ConnectionConfig {
             idle_timeout: Duration::from_secs(65),
             keep_alive_interval: Duration::from_secs(8),
             ack_delay_timeout: Duration::from_millis(50),
+            cookie_hash: None,
         }
     }
 }
@@ -300,10 +318,21 @@ impl RdpeudpConnection {
     ///
     /// After calling this, use `poll_transmit()` to retrieve the SYN
     /// datagram to send on the wire.
-    pub fn connect(config: ConnectionConfig, now: MonotonicInstant) -> Self {
+    ///
+    /// Returns an error if `config.cookie_hash` is absent. The SYN advertises
+    /// protocol version 3, which is what selects the MS-RDPEUDP2 data
+    /// transfer this crate implements, and [MS-RDPEUDP] 2.2.2.9 requires the
+    /// hash to accompany that version.
+    pub fn connect(config: ConnectionConfig, now: MonotonicInstant) -> Result<Self, RdpeudpError> {
+        if config.cookie_hash.is_none() {
+            return Err(RdpeudpError::invalid_state(
+                "connect without ConnectionConfig::cookie_hash, which a version 3 SYN must carry",
+            ));
+        }
+
         let mut conn = Self::new(Side::Client, config);
         conn.enqueue_syn(now);
-        conn
+        Ok(conn)
     }
 
     /// Create a server-side connection from a received SYN datagram.
@@ -329,11 +358,34 @@ impl RdpeudpConnection {
             .as_ref()
             .ok_or_else(|| RdpeudpError::invalid_packet("accept", "SYN datagram missing SynDataEx payload"))?;
 
-        // We only support v2+
-        if !matches!(syn_data_ex.udp_ver, UdpVersion::V2 | UdpVersion::V3) {
+        let expected_hash = config.cookie_hash.ok_or_else(|| {
+            RdpeudpError::invalid_state(
+                "accept without ConnectionConfig::cookie_hash, needed to check the client's SYN",
+            )
+        })?;
+
+        // Only version 3 selects the MS-RDPEUDP2 data transfer (1.3.2.2), and
+        // that is the only data transfer this crate implements. A client
+        // offering version 1 or 2 is asking for the MS-RDPEUDP one.
+        if !syn_data_ex.udp_ver.uses_v2_wire_format() {
             return Err(RdpeudpError::invalid_packet(
                 "accept",
-                "remote does not support RDPEUDP2",
+                "remote offered a protocol version below 3, whose data transfer is MS-RDPEUDP rather than MS-RDPEUDP2",
+            ));
+        }
+
+        // 3.1.5.1.1 asks the server to confirm the hash, and says an invalid
+        // one MUST drop the connection back to version 2. That version means
+        // the MS-RDPEUDP data transfer, which this crate does not implement,
+        // so the only honest outcome is to refuse the connection.
+        let offered_hash = syn_data_ex
+            .cookie_hash
+            .ok_or_else(|| RdpeudpError::invalid_packet("accept", "version 3 SYN carries no cookieHash"))?;
+
+        if offered_hash != expected_hash {
+            return Err(RdpeudpError::invalid_packet(
+                "accept",
+                "cookieHash does not match the security cookie for this multitransport request",
             ));
         }
 
@@ -646,8 +698,14 @@ impl RdpeudpConnection {
             correlation_id: None,
             syn_data_ex: Some(SynDataExPayload {
                 syn_ex_flags: SynExFlags::VERSION_INFO_VALID,
-                udp_ver: UdpVersion::V2,
-                cookie_hash: None,
+                // Version 3 is what selects the MS-RDPEUDP2 data transfer
+                // (1.3.2.2). Version 2 is the same v1 data transfer with
+                // shorter timers, so advertising it and then speaking v2
+                // framing leaves the peer unable to parse anything.
+                udp_ver: UdpVersion::V3,
+                // 2.2.2.9: mandatory with version 3 in a client SYN.
+                // `connect` refuses to build a connection without it.
+                cookie_hash: self.config.cookie_hash,
             }),
         };
 
@@ -679,7 +737,9 @@ impl RdpeudpConnection {
             correlation_id: None,
             syn_data_ex: Some(SynDataExPayload {
                 syn_ex_flags: SynExFlags::VERSION_INFO_VALID,
-                udp_ver: UdpVersion::V2,
+                udp_ver: UdpVersion::V3,
+                // 2.2.2.9 puts the hash in the client's SYN and nowhere else:
+                // "It MUST NOT be present in any other case."
                 cookie_hash: None,
             }),
         };
@@ -758,10 +818,14 @@ impl RdpeudpConnection {
             .as_ref()
             .ok_or_else(|| RdpeudpError::invalid_packet("handle SYN+ACK", "SYN+ACK missing SynDataEx"))?;
 
-        if !matches!(syn_data_ex.udp_ver, UdpVersion::V2 | UdpVersion::V3) {
+        // 3.1.5.1.1: the version in the SYN+ACK is "the highest version
+        // supported by both endpoints", and per 3.1.5.1.3 that is the version
+        // both MUST then use. Anything below 3 means the server settled on the
+        // MS-RDPEUDP data transfer, which this crate does not speak.
+        if !syn_data_ex.udp_ver.uses_v2_wire_format() {
             return Err(RdpeudpError::invalid_packet(
                 "handle SYN+ACK",
-                "server does not support RDPEUDP2",
+                "server settled on a protocol version below 3, whose data transfer is MS-RDPEUDP rather than MS-RDPEUDP2",
             ));
         }
 

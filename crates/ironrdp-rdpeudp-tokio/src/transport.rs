@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use ironrdp_rdpemt::{RdpemtErrorExt as _, TunnelConfig};
 use ironrdp_rdpeudp::pdu::V1Datagram;
 use ironrdp_rdpeudp::{ConnectionConfig, RdpeudpConnection, RdpeudpErrorExt as _};
+use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
@@ -246,7 +247,12 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
     let shared = Arc::new(Mutex::new(SharedIo::new()));
     let connected_notify = Arc::new(Notify::new());
 
-    let conn = RdpeudpConnection::connect(config.connection_config, Clock::new().now());
+    let mut connection_config = config.connection_config;
+    connection_config.cookie_hash = Some(cookie_hash(&config.tunnel_config));
+
+    let conn = RdpeudpConnection::connect(connection_config, Clock::new().now()).map_err(|error| {
+        UdpTransportError::handshake("connect UDP", DriverError::rdpeudp("build RDP-UDP connection", error))
+    })?;
     let driver = Driver::new(socket, conn, Arc::clone(&shared), Arc::clone(&connected_notify));
 
     // Spawn the driver task (it immediately sends the SYN packet)
@@ -404,10 +410,12 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
         )
     })?;
 
-    let conn =
-        RdpeudpConnection::accept(config.connection_config, &syn_datagram, Clock::new().now()).map_err(|error| {
-            UdpTransportError::handshake("accept UDP", DriverError::rdpeudp("accept RDP-UDP connection", error))
-        })?;
+    let mut connection_config = config.connection_config;
+    connection_config.cookie_hash = Some(cookie_hash(&config.tunnel_config));
+
+    let conn = RdpeudpConnection::accept(connection_config, &syn_datagram, Clock::new().now()).map_err(|error| {
+        UdpTransportError::handshake("accept UDP", DriverError::rdpeudp("accept RDP-UDP connection", error))
+    })?;
 
     // Phase 3: Start the driver (it picks up the SYN+ACK from poll_transmit)
     let shared = Arc::new(Mutex::new(SharedIo::new()));
@@ -533,4 +541,16 @@ where
             break;
         }
     }
+}
+
+/// The value a version 3 SYN binds itself to: the SHA-256 of the
+/// `securityCookie` the server sent in the Initiate Multitransport Request
+/// PDU ([MS-RDPEUDP] 2.2.2.9).
+///
+/// Derived here rather than asked of the caller, so the hash in the handshake
+/// is always over the same cookie the RDPEMT tunnel will present a moment
+/// later. The sans-I/O crate takes the finished hash and stays free of any
+/// cryptographic dependency.
+fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
+    Sha256::digest(tunnel_config.security_cookie).into()
 }

@@ -198,10 +198,17 @@ fn version_wire_values() {
     assert_eq!(UdpVersion::V3.as_u16(), 0x0101);
 }
 
+/// Only version 3 selects the MS-RDPEUDP2 data transfer.
+///
+/// The name of version 2 suggests otherwise. [MS-RDPEUDP] 1.3.2.2 is explicit:
+/// the MS-RDPEUDP data transfer messages "MUST be used only when the version
+/// negotiated in the UDP connection initialization phase is version 1 or
+/// version 2", and the 2.2.2.9 table mentions [MS-RDPEUDP2] on the 0x0101 row
+/// alone.
 #[test]
-fn version_v2_wire_format() {
+fn only_version_3_selects_the_v2_wire_format() {
     assert!(!UdpVersion::V1.uses_v2_wire_format());
-    assert!(UdpVersion::V2.uses_v2_wire_format());
+    assert!(!UdpVersion::V2.uses_v2_wire_format());
     assert!(UdpVersion::V3.uses_v2_wire_format());
 }
 

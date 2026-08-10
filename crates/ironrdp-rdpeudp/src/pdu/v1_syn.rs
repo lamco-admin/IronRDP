@@ -131,12 +131,14 @@ bitflags! {
 #[repr(u16)]
 pub enum UdpVersion {
     /// v1: min retransmit 500ms, min ACK delay 200ms.
+    /// Data transfer uses the MS-RDPEUDP wire format.
     V1 = 0x0001,
     /// v2: min retransmit 300ms, min ACK delay 50ms.
-    /// Data transfer uses MS-RDPEUDP2 wire format.
+    /// Data transfer still uses the MS-RDPEUDP wire format.
     V2 = 0x0002,
-    /// v3: same as v2, plus delay-based congestion control.
-    /// SYN includes cookieHash for security binding.
+    /// v3: data transfer uses the MS-RDPEUDP2 wire format.
+    /// The client's SYN carries a cookieHash binding it to the
+    /// multitransport request.
     V3 = 0x0101,
 }
 
@@ -160,9 +162,18 @@ impl UdpVersion {
         }
     }
 
-    /// Whether this version uses the RDPEUDP2 wire format for data transfer.
+    /// Whether this version selects the MS-RDPEUDP2 wire format for data
+    /// transfer.
+    ///
+    /// Only version 3 does. The name of version 2 invites the opposite
+    /// reading and it is wrong: 2.2.2.9 describes 0x0002 purely as a pair of
+    /// shorter timeouts, and 0x0101 is the only row that mentions
+    /// [MS-RDPEUDP2]. 1.3.2.2 states it from the other direction, that the
+    /// MS-RDPEUDP data transfer messages "MUST be used only when the version
+    /// negotiated in the UDP connection initialization phase is version 1 or
+    /// version 2".
     pub fn uses_v2_wire_format(self) -> bool {
-        matches!(self, Self::V2 | Self::V3)
+        matches!(self, Self::V3)
     }
 
     /// Minimum retransmission timeout for this version.
