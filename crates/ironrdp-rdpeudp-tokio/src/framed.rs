@@ -24,13 +24,27 @@ impl FramedRead for UdpTransport {
 
     fn read<'a>(&'a mut self, buf: &'a mut BytesMut) -> Self::ReadFut<'a> {
         Box::pin(async move {
-            match self.recv().await {
-                Some(data) => {
-                    let n = data.len();
-                    buf.extend_from_slice(&data);
-                    Ok(n)
+            // `ironrdp_async::Framed` reads a zero return as end of stream, so
+            // an empty message must never be reported as one. Carrying no
+            // higher-layer bytes is not the same as the peer hanging up.
+            //
+            // Empty Tunnel Data PDUs are ordinary traffic. [MS-RDPEMT] 2.2.2.3
+            // puts no minimum on HigherLayerData, and [MS-RDPBCGR] 1.3.9 sends
+            // the four Continuous Auto-Detection messages "encapsulated in the
+            // RDP_TUNNEL_SUBHEADER structure ... over the sideband channels
+            // that are in active use". The tunnel has already taken what it
+            // needs from those subheaders by the time we get here, leaving a
+            // payload of nothing to pass on.
+            loop {
+                match self.recv().await {
+                    Some(data) if data.is_empty() => continue,
+                    Some(data) => {
+                        let n = data.len();
+                        buf.extend_from_slice(&data);
+                        return Ok(n);
+                    }
+                    None => return Ok(0), // EOF: tunnel closed
                 }
-                None => Ok(0), // EOF: tunnel closed
             }
         })
     }
@@ -85,6 +99,44 @@ mod tests {
 
         let mut buf = BytesMut::new();
         let n = FramedRead::read(&mut transport, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+    }
+
+    /// A Tunnel Data PDU carrying no higher-layer bytes is ordinary traffic,
+    /// not the end of the stream.
+    ///
+    /// [MS-RDPEMT] 2.2.2.3 sets no minimum on HigherLayerData, and the
+    /// Continuous Auto-Detection messages of [MS-RDPBCGR] 1.3.9 ride the
+    /// sideband channels in the subheaders, leaving the payload empty. Since
+    /// `ironrdp_async::Framed` turns a zero-length read into
+    /// `UnexpectedEof`, reporting one here tears down a session whose
+    /// transport, TLS and tunnel are all still healthy.
+    #[tokio::test]
+    async fn framed_read_does_not_mistake_an_empty_message_for_eof() {
+        let (mut transport, feeder, _) = test_transport();
+
+        feeder.send(Vec::new()).await.unwrap();
+        feeder.send(vec![0x11, 0x22]).await.unwrap();
+
+        let mut buf = BytesMut::new();
+        let n = FramedRead::read(&mut transport, &mut buf).await.unwrap();
+
+        assert_eq!(n, 2, "an empty message must not read as end of stream");
+        assert_eq!(&*buf, &[0x11, 0x22]);
+    }
+
+    /// The channel closing after an empty message is still end of stream.
+    #[tokio::test]
+    async fn framed_read_still_reports_eof_after_an_empty_message() {
+        let (mut transport, feeder, _) = test_transport();
+
+        feeder.send(Vec::new()).await.unwrap();
+        drop(feeder);
+
+        let mut buf = BytesMut::new();
+        let n = FramedRead::read(&mut transport, &mut buf).await.unwrap();
+
         assert_eq!(n, 0);
         assert!(buf.is_empty());
     }
