@@ -954,7 +954,7 @@ pub fn rdpeudp_connection(data: &[u8]) {
             if let Some(deadline) = conn.poll_timeout() {
                 assert!(
                     deadline > now,
-                    "handle_timeout left a timer due at the same instant, which spins the driver"
+                    "handle_timeout left a timer due at {deadline:?} with now={now:?}, which spins the driver"
                 );
             }
         }

@@ -453,3 +453,33 @@ fn idle_close_leaves_no_timer_armed() {
     conn.handle_timeout(now);
     assert_eq!(conn.poll_timeout(), None, "a closed connection re-armed a timer");
 }
+
+/// Regression: a closed connection must not emit packets or arm timers.
+///
+/// `poll_transmit` drained queued handshake packets before checking the state,
+/// and armed the keep-alive timer on the way past. `close` had already cleared
+/// the timers and `handle_timeout` returns early once closed, so that deadline
+/// stayed due forever and a caller polling it without checking `is_closed`
+/// would wake immediately, do nothing, and spin.
+///
+/// Found by the `rdpeudp_connection` fuzz oracle.
+#[test]
+fn closed_connection_transmits_nothing_and_arms_nothing() {
+    let now = MonotonicInstant::from_millis(0);
+
+    // Close while the SYN is still queued, which is the state the oracle found.
+    let mut conn = RdpeudpConnection::connect(default_config(100), now);
+    conn.close();
+
+    assert!(
+        conn.poll_transmit(now).is_none(),
+        "a closed connection emitted a packet"
+    );
+    assert_eq!(conn.poll_timeout(), None, "a closed connection armed a timer");
+
+    // And it stays that way once the clock moves on.
+    let later = now + Duration::from_secs(30);
+    conn.handle_timeout(later);
+    assert!(conn.poll_transmit(later).is_none());
+    assert_eq!(conn.poll_timeout(), None);
+}

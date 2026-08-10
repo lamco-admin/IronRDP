@@ -8,7 +8,6 @@ fn ack_payload_no_delayed() {
         seq_num: 0x1234,
         received_ts: 0x00AB_CDEF,
         send_ack_time_gap: 5,
-        num_delayed_acks: 0,
         delay_ack_time_scale: 0,
         delay_ack_time_additions: Vec::new(),
     };
@@ -26,7 +25,6 @@ fn ack_payload_with_delayed() {
         seq_num: 0x0042,
         received_ts: 0x00_123456,
         send_ack_time_gap: 10,
-        num_delayed_acks: 3,
         delay_ack_time_scale: 2,
         delay_ack_time_additions: vec![15, 20, 25],
     };
@@ -44,7 +42,6 @@ fn ack_payload_timestamp_24bit() {
         seq_num: 0,
         received_ts: 0x00FF_FFFF, // max 24-bit value
         send_ack_time_gap: 0,
-        num_delayed_acks: 0,
         delay_ack_time_scale: 0,
         delay_ack_time_additions: Vec::new(),
     };
@@ -60,7 +57,6 @@ fn ack_payload_timestamp_masked() {
         seq_num: 0,
         received_ts: 0xFFFF_FFFF, // bits above 24 set
         send_ack_time_gap: 0,
-        num_delayed_acks: 0,
         delay_ack_time_scale: 0,
         delay_ack_time_additions: Vec::new(),
     };
@@ -76,7 +72,6 @@ fn ack_payload_nibble_packing() {
         seq_num: 0,
         received_ts: 0,
         send_ack_time_gap: 0,
-        num_delayed_acks: 15,    // max for 4 bits
         delay_ack_time_scale: 8, // arbitrary 4-bit value
         delay_ack_time_additions: vec![0; 15],
     };
@@ -85,7 +80,7 @@ fn ack_payload_nibble_packing() {
     assert_eq!(encoded[6], 0xF8);
 
     let decoded: AckPayload = decode(&encoded).expect("decode");
-    assert_eq!(decoded.num_delayed_acks, 15);
+    assert_eq!(decoded.delay_ack_time_additions.len(), 15);
     assert_eq!(decoded.delay_ack_time_scale, 8);
 }
 
@@ -283,4 +278,47 @@ fn ack_vector_insufficient_timestamp_block() {
     ];
     let result: DecodeResult<AckVectorPayload> = decode(&bytes);
     assert!(result.is_err());
+}
+
+/// The delayed-ACK count is carried in a 4-bit nibble, so a vector that cannot
+/// be expressed must be rejected rather than truncated.
+///
+/// Truncating produced a packet whose header promised delayed ACKs the encoder
+/// never wrote, which a peer would then read out of the following payload.
+/// Found by the `rdpeudp_pdu_round_trip` fuzz oracle.
+#[test]
+fn ack_payload_rejects_more_delayed_acks_than_the_nibble_holds() {
+    let ack = AckPayload {
+        seq_num: 0,
+        received_ts: 0,
+        send_ack_time_gap: 0,
+        delay_ack_time_scale: 0,
+        delay_ack_time_additions: vec![0; 16],
+    };
+
+    encode_vec(&ack).expect_err("16 delayed ACKs do not fit in a 4-bit count");
+}
+
+/// The count on the wire always matches the vector that was encoded.
+#[test]
+fn ack_payload_count_follows_the_vector() {
+    for len in [0usize, 1, 7, 15] {
+        let ack = AckPayload {
+            seq_num: 1,
+            received_ts: 2,
+            send_ack_time_gap: 3,
+            delay_ack_time_scale: 4,
+            delay_ack_time_additions: vec![0xAA; len],
+        };
+
+        let encoded = encode_vec(&ack).expect("encode");
+        assert_eq!(
+            usize::from(encoded[6] >> 4),
+            len,
+            "packed count disagrees with the vector"
+        );
+
+        let decoded: AckPayload = decode(&encoded).expect("decode");
+        assert_eq!(decoded, ack, "round-trip changed the value");
+    }
 }

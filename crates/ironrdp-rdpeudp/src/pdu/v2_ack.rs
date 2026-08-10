@@ -31,16 +31,16 @@ pub struct AckPayload {
     /// Time in milliseconds between packet receipt and ACK send.
     pub send_ack_time_gap: u8,
 
-    /// Number of additional delayed ACKs bundled (0..=15).
-    pub num_delayed_acks: u8,
-
     /// Scale for delay time additions (0..=15).
     /// Each addition is in units of `(1 << delay_ack_time_scale)` microseconds.
     pub delay_ack_time_scale: u8,
 
     /// Per-ACK time deltas in reverse chronological order.
-    /// Length = `num_delayed_acks`.
-    /// Each byte × `(1 << delay_ack_time_scale)` microseconds gives the
+    ///
+    /// The wire format carries the count in the high nibble of the packed
+    /// byte, so it is derived from this vector on encode rather than stored.
+    /// At most 15 entries fit; `encode` rejects more.
+    /// Each byte times `(1 << delay_ack_time_scale)` microseconds gives the
     /// time between adjacent acknowledgments.
     pub delay_ack_time_additions: Vec<u8>,
 }
@@ -68,8 +68,17 @@ impl Encode for AckPayload {
 
         dst.write_u8(self.send_ack_time_gap);
 
-        // Pack numDelayedAcks(high nibble) and delayAckTimeScale(low nibble)
-        let packed = ((self.num_delayed_acks & 0x0F) << 4) | (self.delay_ack_time_scale & 0x0F);
+        // Pack numDelayedAcks(high nibble) and delayAckTimeScale(low nibble).
+        // The count comes from the vector, never from a separate field: the
+        // two can disagree, and a truncated count leaves the decoder reading
+        // entries that were never written.
+        let num_delayed_acks = u8::try_from(self.delay_ack_time_additions.len())
+            .ok()
+            .filter(|count| *count <= 0x0F)
+            .ok_or_else(|| {
+                ironrdp_core::invalid_field_err!("AckPayload", "numDelayedAcks", "exceeds 4-bit maximum (15)")
+            })?;
+        let packed = (num_delayed_acks << 4) | (self.delay_ack_time_scale & 0x0F);
         dst.write_u8(packed);
 
         dst.write_slice(&self.delay_ack_time_additions);
@@ -112,7 +121,6 @@ impl Decode<'_> for AckPayload {
             seq_num,
             received_ts,
             send_ack_time_gap,
-            num_delayed_acks,
             delay_ack_time_scale,
             delay_ack_time_additions,
         })

@@ -224,6 +224,18 @@ impl SynDataExPayload {
 
 impl Encode for SynDataExPayload {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        // The decoder reads the cookie hash only for version 3, so a hash
+        // carried alongside any other version would be written and never read
+        // back. Reject it rather than drop it silently: a caller that set the
+        // field meant it, and the combination cannot be put on the wire.
+        if self.cookie_hash.is_some() && self.udp_ver != UdpVersion::V3 {
+            return Err(ironrdp_core::invalid_field_err!(
+                Self::NAME,
+                "cookieHash",
+                "is only carried when uUdpVer is version 3"
+            ));
+        }
+
         ironrdp_core::ensure_size!(in: dst, size: self.encoded_size());
 
         dst.write_u16(self.syn_ex_flags.bits());

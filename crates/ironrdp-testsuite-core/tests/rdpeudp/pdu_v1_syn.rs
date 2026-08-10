@@ -214,3 +214,34 @@ fn version_timer_minimums() {
     assert_eq!(UdpVersion::V2.min_ack_delay_ms(), 50);
     assert_eq!(UdpVersion::V3.min_ack_delay_ms(), 50);
 }
+
+/// The cookie hash rides only on version 3, so any other version carrying one
+/// must be rejected rather than encoded and silently dropped on the way back.
+///
+/// The decoder reads the hash only for version 3; the encoder used to write it
+/// for any version, so 32 bytes went out that no peer would read back.
+/// Found by the `rdpeudp_pdu_round_trip` fuzz oracle.
+#[test]
+fn syn_data_ex_rejects_a_cookie_hash_without_version_3() {
+    let payload = SynDataExPayload {
+        syn_ex_flags: SynExFlags::VERSION_INFO_VALID,
+        udp_ver: UdpVersion::V2,
+        cookie_hash: Some([0u8; 32]),
+    };
+
+    encode_vec(&payload).expect_err("a cookie hash cannot ride on version 2");
+}
+
+/// Version 3 with a cookie hash round-trips.
+#[test]
+fn syn_data_ex_round_trips_a_version_3_cookie_hash() {
+    let payload = SynDataExPayload {
+        syn_ex_flags: SynExFlags::VERSION_INFO_VALID,
+        udp_ver: UdpVersion::V3,
+        cookie_hash: Some([0xAB; 32]),
+    };
+
+    let encoded = encode_vec(&payload).expect("encode");
+    let decoded: SynDataExPayload = decode(&encoded).expect("decode");
+    assert_eq!(decoded, payload);
+}

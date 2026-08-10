@@ -408,6 +408,15 @@ impl RdpeudpConnection {
     /// buffer when congestion window budget is available, processes
     /// retransmissions, and sends standalone ACKs.
     pub fn poll_transmit(&mut self, now: MonotonicInstant) -> Option<Transmit> {
+        // A closed connection has nothing left to say. Returning early also
+        // keeps the handshake branch below from arming the keep-alive timer
+        // after `close` cleared it: `handle_timeout` returns early once closed,
+        // so a timer armed here would stay due forever and a caller polling
+        // the deadline without checking `is_closed` would spin.
+        if self.state == State::Closed {
+            return None;
+        }
+
         // First, drain any pre-built transmits (handshake packets)
         if let Some(t) = self.pending_transmits.pop_front() {
             self.timers.set(Timer::KeepAlive, now + self.config.keep_alive_interval);
@@ -1237,7 +1246,6 @@ impl RdpeudpConnection {
             seq_num: seq::truncate_seq(cumulative_seq),
             received_ts: seq::truncate_timestamp(self.local_timestamp_ref),
             send_ack_time_gap: 0, // Simplified, real implementation would track processing delay
-            num_delayed_acks: 0,
             delay_ack_time_scale: 0,
             delay_ack_time_additions: Vec::new(),
         }
