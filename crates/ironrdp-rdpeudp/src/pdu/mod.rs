@@ -38,7 +38,7 @@ pub mod prefix;
 
 // ── Prefix re-exports ──
 pub use prefix::{PacketPrefixByte, PrefixError, decode_with_prefix, encode_with_prefix};
-pub use v1_ack::{CorrelationIdPayload, V1AckOfAcksHeader, V1AckVectorElement, V1AckVectorHeader};
+pub use v1_ack::{CorrelationIdPayload, V1AckOfAcksHeader, V1AckVectorElement, V1AckVectorHeader, VectorElementState};
 pub use v1_flags::V1Flags;
 pub use v1_header::FecHeader;
 pub use v1_syn::{MTU_MAX, MTU_MIN, SynDataExPayload, SynDataPayload, SynExFlags, UdpVersion};

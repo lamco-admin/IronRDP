@@ -32,7 +32,7 @@ use crate::congestion::CongestionControl;
 use crate::error::{RdpeudpError, RdpeudpErrorExt as _};
 use crate::loss::LossDetector;
 use crate::pdu::prefix::{decode_with_prefix, encode_with_prefix};
-use crate::pdu::v1_ack::{V1AckVectorElement, V1AckVectorHeader};
+use crate::pdu::v1_ack::{V1AckVectorElement, V1AckVectorHeader, VectorElementState};
 use crate::pdu::v1_flags::V1Flags;
 use crate::pdu::v1_header::FecHeader;
 use crate::pdu::v1_syn::{SynDataExPayload, SynDataPayload, SynExFlags, UdpVersion};
@@ -584,7 +584,7 @@ impl RdpeudpConnection {
             },
             ack_vector: Some(V1AckVectorHeader {
                 elements: vec![V1AckVectorElement {
-                    received: true,
+                    state: VectorElementState::DatagramReceived,
                     length: 1,
                 }],
             }),
@@ -693,7 +693,7 @@ impl RdpeudpConnection {
             },
             ack_vector: Some(V1AckVectorHeader {
                 elements: vec![V1AckVectorElement {
-                    received: true,
+                    state: VectorElementState::DatagramReceived,
                     length: 1,
                 }],
             }),

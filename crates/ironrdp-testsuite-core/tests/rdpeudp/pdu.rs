@@ -49,7 +49,7 @@ fn v1_syn_ack_datagram_roundtrip() {
         },
         ack_vector: Some(V1AckVectorHeader {
             elements: vec![V1AckVectorElement {
-                received: true,
+                state: VectorElementState::DatagramReceived,
                 length: 1,
             }],
         }),
@@ -67,8 +67,9 @@ fn v1_syn_ack_datagram_roundtrip() {
         }),
     };
 
-    // header(8) + ack_vector(2+1=3) + syndata(8) + syndataex(4) = 23
-    assert_eq!(datagram.size(), 23);
+    // header(8) + ack_vector(2 + 1 element + 1 pad = 4) + syndata(8) + syndataex(4) = 24.
+    // The ACK vector pads to a DWORD boundary, per [MS-RDPEUDP] 2.2.2.7.
+    assert_eq!(datagram.size(), 24);
 
     let encoded = encode_vec(&datagram).expect("encode");
     let decoded: V1Datagram = decode(&encoded).expect("decode");
@@ -87,11 +88,11 @@ fn v1_ack_datagram_roundtrip() {
         ack_vector: Some(V1AckVectorHeader {
             elements: vec![
                 V1AckVectorElement {
-                    received: true,
+                    state: VectorElementState::DatagramReceived,
                     length: 5,
                 },
                 V1AckVectorElement {
-                    received: false,
+                    state: VectorElementState::DatagramNotYetReceived,
                     length: 2,
                 },
             ],
@@ -138,8 +139,9 @@ fn v1_syn_with_correlation_id_roundtrip() {
         }),
     };
 
-    // header(8) + syndata(8) + correlation_id(16) + syndataex(4) = 36
-    assert_eq!(datagram.size(), 36);
+    // header(8) + syndata(8) + correlation(16 id + 16 reserved = 32) + syndataex(4) = 52.
+    // [MS-RDPEUDP] 2.2.2.8 makes RDPUDP_CORRELATION_ID_PAYLOAD 32 bytes.
+    assert_eq!(datagram.size(), 52);
 
     let encoded = encode_vec(&datagram).expect("encode");
     let decoded: V1Datagram = decode(&encoded).expect("decode");
@@ -222,7 +224,7 @@ fn v1_standalone_flags_preserved() {
         },
         ack_vector: Some(V1AckVectorHeader {
             elements: vec![V1AckVectorElement {
-                received: true,
+                state: VectorElementState::DatagramReceived,
                 length: 10,
             }],
         }),

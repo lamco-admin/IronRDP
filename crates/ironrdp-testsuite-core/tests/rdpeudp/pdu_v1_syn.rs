@@ -2,10 +2,11 @@ use ironrdp_core::{DecodeResult, Encode as _, decode, encode_vec};
 use ironrdp_rdpeudp::pdu::*;
 // -- SynDataPayload tests --
 
+// Network byte order, per [MS-RDPEUDP] 2.2.
 const SYNDATA_BYTES: [u8; 8] = [
-    0x78, 0x56, 0x34, 0x12, // snInitialSequenceNumber = 0x12345678
-    0xD0, 0x04, // uUpStreamMtu = 1232
-    0x6C, 0x04, // uDownStreamMtu = 1132
+    0x12, 0x34, 0x56, 0x78, // snInitialSequenceNumber = 0x12345678
+    0x04, 0xD0, // uUpStreamMtu = 1232
+    0x04, 0x6C, // uDownStreamMtu = 1132
 ];
 
 fn syndata() -> SynDataPayload {
@@ -97,8 +98,8 @@ fn encode_syndataex_v2_no_cookie() {
     assert_eq!(
         encoded.as_slice(),
         &[
-            0x01, 0x00, // uSynExFlags = VERSION_INFO_VALID
-            0x02, 0x00, // uUdpVer = V2
+            0x00, 0x01, // uSynExFlags = VERSION_INFO_VALID
+            0x00, 0x02, // uUdpVer = V2
         ]
     );
     assert_eq!(payload.size(), 4);
@@ -106,7 +107,7 @@ fn encode_syndataex_v2_no_cookie() {
 
 #[test]
 fn decode_syndataex_v2_no_cookie() {
-    let bytes = [0x01, 0x00, 0x02, 0x00];
+    let bytes = [0x00, 0x01, 0x00, 0x02];
     let decoded: SynDataExPayload = decode(&bytes).expect("decode");
     assert_eq!(decoded.udp_ver, UdpVersion::V2);
     assert!(decoded.cookie_hash.is_none());
@@ -244,4 +245,19 @@ fn syn_data_ex_round_trips_a_version_3_cookie_hash() {
     let encoded = encode_vec(&payload).expect("encode");
     let decoded: SynDataExPayload = decode(&encoded).expect("decode");
     assert_eq!(decoded, payload);
+}
+
+/// The SYNDATA payload from the [MS-RDPEUDP] 4.1.1 SYN capture.
+#[test]
+fn decode_the_spec_syndata_capture() {
+    // 00 00 00 42 04 D0 04 D0, documented as snInitialSequenceNumber 0x42 and
+    // both MTUs 0x04D0 = 1232.
+    const CAPTURE: [u8; 8] = [0x00, 0x00, 0x00, 0x42, 0x04, 0xD0, 0x04, 0xD0];
+
+    let payload: SynDataPayload = decode(&CAPTURE).expect("decode");
+    assert_eq!(payload.initial_sequence_number, 0x42);
+    assert_eq!(payload.upstream_mtu, 1232);
+    assert_eq!(payload.downstream_mtu, 1232);
+
+    assert_eq!(encode_vec(&payload).expect("encode"), CAPTURE);
 }

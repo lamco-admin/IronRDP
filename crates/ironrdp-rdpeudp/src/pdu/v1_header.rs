@@ -34,9 +34,9 @@ impl Encode for FecHeader {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ironrdp_core::ensure_fixed_part_size!(in: dst);
 
-        dst.write_u32(self.sn_source_ack);
-        dst.write_u16(self.receive_window_size);
-        dst.write_u16(self.flags.bits());
+        dst.write_u32_be(self.sn_source_ack);
+        dst.write_u16_be(self.receive_window_size);
+        dst.write_u16_be(self.flags.bits());
 
         Ok(())
     }
@@ -54,9 +54,9 @@ impl Decode<'_> for FecHeader {
     fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         ironrdp_core::ensure_fixed_part_size!(in: src);
 
-        let sn_source_ack = src.read_u32();
-        let receive_window_size = src.read_u16();
-        let flags_raw = src.read_u16();
+        let sn_source_ack = src.read_u32_be();
+        let receive_window_size = src.read_u16_be();
+        let flags_raw = src.read_u16_be();
 
         let flags = V1Flags::from_bits_truncate(flags_raw);
 

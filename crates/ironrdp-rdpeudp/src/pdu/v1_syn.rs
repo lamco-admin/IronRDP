@@ -72,9 +72,9 @@ impl Encode for SynDataPayload {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ironrdp_core::ensure_fixed_part_size!(in: dst);
 
-        dst.write_u32(self.initial_sequence_number);
-        dst.write_u16(self.upstream_mtu);
-        dst.write_u16(self.downstream_mtu);
+        dst.write_u32_be(self.initial_sequence_number);
+        dst.write_u16_be(self.upstream_mtu);
+        dst.write_u16_be(self.downstream_mtu);
 
         Ok(())
     }
@@ -92,9 +92,9 @@ impl Decode<'_> for SynDataPayload {
     fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         ironrdp_core::ensure_fixed_part_size!(in: src);
 
-        let initial_sequence_number = src.read_u32();
-        let upstream_mtu = src.read_u16();
-        let downstream_mtu = src.read_u16();
+        let initial_sequence_number = src.read_u32_be();
+        let upstream_mtu = src.read_u16_be();
+        let downstream_mtu = src.read_u16_be();
 
         Self::validate_mtu(upstream_mtu, "uUpStreamMtu")?;
         Self::validate_mtu(downstream_mtu, "uDownStreamMtu")?;
@@ -238,8 +238,8 @@ impl Encode for SynDataExPayload {
 
         ironrdp_core::ensure_size!(in: dst, size: self.encoded_size());
 
-        dst.write_u16(self.syn_ex_flags.bits());
-        dst.write_u16(self.udp_ver.as_u16());
+        dst.write_u16_be(self.syn_ex_flags.bits());
+        dst.write_u16_be(self.udp_ver.as_u16());
 
         if let Some(hash) = &self.cookie_hash {
             dst.write_slice(hash);
@@ -261,10 +261,10 @@ impl Decode<'_> for SynDataExPayload {
     fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         ironrdp_core::ensure_fixed_part_size!(in: src);
 
-        let syn_ex_flags_raw = src.read_u16();
+        let syn_ex_flags_raw = src.read_u16_be();
         let syn_ex_flags = SynExFlags::from_bits_truncate(syn_ex_flags_raw);
 
-        let udp_ver_raw = src.read_u16();
+        let udp_ver_raw = src.read_u16_be();
         let udp_ver = UdpVersion::from_u16(udp_ver_raw).ok_or_else(|| {
             ironrdp_core::invalid_field_err!("RDPUDP_SYNDATAEX_PAYLOAD", "uUdpVer", "unknown protocol version")
         })?;
