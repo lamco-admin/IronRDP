@@ -340,8 +340,9 @@ fn poll_timeout_returns_earliest() {
 fn congestion_backpressure() {
     let (mut client, _server, t) = establish_pair();
 
-    // Fill the congestion window
-    let mtu_data = vec![0xAA; 1200]; // near MTU
+    // One packet's worth per write, so the count below stays a packet count.
+    // A larger write would be split and the arithmetic would not follow.
+    let mtu_data = vec![0xAA; client.max_payload()];
     let mut sent_count = 0u32;
 
     for _ in 0..100 {
@@ -361,8 +362,9 @@ fn congestion_backpressure() {
         }
     }
 
-    // Should have been limited by the congestion window
-    // Initial window is 12320 bytes, each packet ~1200 bytes → ~10 packets
+    // Should have been limited by the congestion window.
+    // The initial window is 12320 bytes and each packet carries one full
+    // payload, so a dozen or so go out before it closes.
     assert!(transmit_count > 0);
     assert!(transmit_count <= 15); // reasonable upper bound with overhead
 }
@@ -1122,5 +1124,88 @@ fn a_dummy_does_not_disturb_the_channel_sequence() {
         drain_received(&mut server),
         vec![vec![0xA2; 8]],
         "a dummy must not disturb the channel sequence"
+    );
+}
+
+// ── Segmentation ──
+//
+// [MS-RDPEUDP2] does not segment. 3.1.1.2.4.2 has the receiver strip the
+// ChannelSeqNum and forward "the rest of the data payload to the upper layer
+// immediately", and nothing in the format marks a first or last fragment, so a
+// packet's payload arrives whole or not at all. Anything longer than one
+// packet has to be split before it becomes packets.
+
+/// Every datagram the connection emits fits the MTU, however much the caller
+/// writes at once.
+///
+/// The caller above is a TLS session, which emits records up to about 16 KiB
+/// and knows nothing about datagrams. Passing one of those through as a single
+/// packet produces an IP-fragmented datagram thirteen times the MTU, where one
+/// lost fragment destroys the whole thing and no retransmission can recover a
+/// fragment.
+#[test]
+fn a_write_larger_than_a_packet_is_split_to_fit() {
+    let (mut client, mut server, t) = establish_pair();
+
+    let payload: Vec<u8> = (0..16_384u32)
+        .map(|i| u8::try_from(i % 256).expect("modulo 256 fits in u8"))
+        .collect();
+    client.send(payload.clone()).expect("send");
+
+    let mut packets = 0usize;
+    let mut at = later(t, 100);
+    for _ in 0..2_000 {
+        let mut moved = false;
+
+        while let Some(transmit) = client.poll_transmit(at) {
+            assert!(
+                transmit.contents.len() <= 1232,
+                "a {} byte datagram exceeds the 1232 byte MTU",
+                transmit.contents.len()
+            );
+            packets += 1;
+
+            let mut bytes = transmit.contents;
+            server.handle_datagram(&mut bytes, at).expect("server handles");
+            moved = true;
+        }
+
+        while let Some(transmit) = server.poll_transmit(at) {
+            let mut bytes = transmit.contents;
+            client.handle_datagram(&mut bytes, at).expect("client handles");
+            moved = true;
+        }
+
+        if !moved {
+            let Some(next) = [client.poll_timeout(), server.poll_timeout()]
+                .into_iter()
+                .flatten()
+                .min()
+            else {
+                break;
+            };
+
+            at = next;
+            client.handle_timeout(at);
+            server.handle_timeout(at);
+        }
+    }
+
+    assert!(packets > 1, "16 KiB should not have gone out as one packet");
+
+    let received: Vec<u8> = drain_received(&mut server).concat();
+    assert_eq!(received, payload, "the split payload did not reassemble");
+}
+
+/// The split is sized from the negotiated MTU, not from a fixed guess.
+#[test]
+fn the_payload_limit_follows_the_negotiated_mtu() {
+    let (client, _server, _t) = establish_pair();
+
+    let max_payload = client.max_payload();
+    assert!(max_payload > 0);
+    assert!(
+        max_payload + 7 + 136 <= 1232,
+        "the payload limit leaves no room for framing"
     );
 }

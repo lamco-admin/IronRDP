@@ -158,6 +158,34 @@ impl Default for ConnectionConfig {
 // Internal state
 // ════════════════════════════════════════════════════════════════════
 
+/// The RDP-UDP2 MTU.
+///
+/// [MS-RDPEUDP2] 1.5 fixes it: "The maximum transmission unit (MTU) size in
+/// RDP-UDP2 transport layer is set to 1232 bytes." The v1 handshake still
+/// negotiates `uUpStreamMtu` and `uDownStreamMtu` in the range 1132 to 1232,
+/// so the effective limit is whichever of the two is smaller.
+const RDPEUDP2_MTU: usize = 1232;
+
+/// What a data packet spends on framing before any payload: the
+/// PacketPrefixByte (1), the RDP-UDP2 header (2), the DataHeader (2) and the
+/// DataBody's ChannelSeqNum (2).
+const DATA_PACKET_OVERHEAD: usize = 7;
+
+/// Room held back on every data packet for an acknowledgment riding along.
+///
+/// The largest is an ACK vector: three bytes fixed, four for the timestamp
+/// block, and up to 127 entries, that being the limit of its 7-bit size field.
+/// The cumulative form reaches 22 and cannot appear beside it, since 2.2.1.1
+/// makes the two flags mutually exclusive. An AckOfAcks adds two more.
+///
+/// Reserving the worst case costs about a tenth of each packet on a link with
+/// nothing to report. Measuring instead, and dropping the acknowledgment when
+/// it would not fit, would buy that back at the cost of a second way for a
+/// packet to be built; not worth it until something shows the throughput
+/// matters. `a_full_data_packet_fits_the_mtu` checks this figure against the
+/// encoders rather than leaving it as arithmetic in a comment.
+const PIGGYBACK_RESERVE: usize = 134 + 2;
+
 /// How many unanswered retransmits of a handshake datagram we tolerate
 /// before closing.
 ///
@@ -471,8 +499,41 @@ impl RdpeudpConnection {
             _ => return Err(RdpeudpError::invalid_state("send")),
         }
 
-        self.send_buffer.push_back(data);
+        let max_payload = self.max_payload();
+
+        if data.len() <= max_payload {
+            self.send_buffer.push_back(data);
+            return Ok(());
+        }
+
+        // Split rather than reject. The caller here is a TLS session writing a
+        // byte stream: it has no message boundaries to preserve and no notion
+        // of what fits in a datagram, and the receiving end concatenates
+        // whatever arrives before handing it back to TLS.
+        for chunk in data.chunks(max_payload) {
+            self.send_buffer.push_back(chunk.to_vec());
+        }
+
         Ok(())
+    }
+
+    /// The largest payload this connection will put in one packet.
+    ///
+    /// [MS-RDPEUDP2] has no segmentation. 3.1.1.2.4.2 has the receiver strip
+    /// the ChannelSeqNum and forward "the rest of the data payload to the
+    /// upper layer immediately", and the format carries no first or last
+    /// marker to reassemble by, so a packet's payload arrives whole or not at
+    /// all. Anything longer has to be split before it becomes packets, which
+    /// is what [`send`] does.
+    ///
+    /// [`send`]: Self::send
+    pub fn max_payload(&self) -> usize {
+        let mtu = self
+            .params
+            .as_ref()
+            .map_or(RDPEUDP2_MTU, |params| usize::from(params.mtu).min(RDPEUDP2_MTU));
+
+        mtu.saturating_sub(DATA_PACKET_OVERHEAD + PIGGYBACK_RESERVE).max(1)
     }
 
     /// Process a received wire-format datagram.
@@ -1661,5 +1722,75 @@ impl core::fmt::Debug for RdpeudpConnection {
             .field("pending_events", &self.pending_events.len())
             .field("send_buffer", &self.send_buffer.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The worst data packet this connection can build still fits the MTU.
+    ///
+    /// `PIGGYBACK_RESERVE` is arithmetic over payload sizes that live in
+    /// another module, so measure it rather than trust it. If any of those
+    /// payloads grows, this fails instead of a peer silently receiving an
+    /// over-length datagram.
+    #[test]
+    fn a_full_data_packet_fits_the_mtu() {
+        let max_payload = RDPEUDP2_MTU - DATA_PACKET_OVERHEAD - PIGGYBACK_RESERVE;
+
+        let packet = V2Packet {
+            header: V2Header {
+                flags: V2Flags::DATA | V2Flags::ACKVEC | V2Flags::AOA,
+                log_window_size: 6,
+            },
+            ack: None,
+            overhead_size: None,
+            delay_ack_info: None,
+            ack_of_acks: Some(AckOfAcksPayload {
+                ack_of_acks_seq_num: 0xFFFF,
+            }),
+            data_header: Some(DataHeader { data_seq_num: 0xFFFF }),
+            // The biggest vector the 7-bit size field can describe, with the
+            // optional timestamp block present.
+            ack_vector: Some(AckVectorPayload {
+                base_seq_num: 0xFFFF,
+                timestamp: Some(0x00FF_FFFF),
+                send_ack_time_gap_ms: Some(0xFF),
+                entries: vec![
+                    AckVectorEntry::RunLength {
+                        received: true,
+                        length: 63,
+                    };
+                    127
+                ],
+            }),
+            data_body: Some(DataBody {
+                channel_seq_num: 0xFFFF,
+                data: vec![0xAB; max_payload],
+            }),
+        };
+
+        let encoded = encode_vec(&packet).expect("encode");
+
+        let mut wire = Vec::new();
+        encode_with_prefix(&encoded, false, &mut wire).expect("prefix");
+
+        assert!(
+            wire.len() <= RDPEUDP2_MTU,
+            "a full data packet is {} bytes, over the {RDPEUDP2_MTU} byte MTU",
+            wire.len()
+        );
+    }
+
+    /// The reserve should not be wildly larger than it needs to be either.
+    #[test]
+    fn the_piggyback_reserve_is_not_wasteful() {
+        let max_payload = RDPEUDP2_MTU - DATA_PACKET_OVERHEAD - PIGGYBACK_RESERVE;
+
+        assert!(
+            max_payload >= 1000,
+            "only {max_payload} bytes of every packet are usable"
+        );
     }
 }

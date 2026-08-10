@@ -126,13 +126,19 @@ async fn full_stack_message_ordering() {
     server.shutdown().await.expect("shutdown");
 }
 
-/// Verify that a larger payload survives the full stack.
+/// Verify that a payload larger than one RDPEUDP2 packet survives the full
+/// stack.
+///
+/// Sized well past the 1232 byte MTU on purpose, to check that a split write
+/// comes back together. It does not check that the split happened: loopback
+/// carries an oversized datagram perfectly well, which is why an unsegmented
+/// 16 KiB write passed here for as long as it did. The datagram sizes
+/// themselves are asserted in `rdpeudp::connection`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_stack_larger_payload() {
     let (client, mut server) = establish_loopback_pair().await;
 
-    // ~1 KB payload -- within a single RDPEUDP2 segment
-    let payload: Vec<u8> = (0..1000u32)
+    let payload: Vec<u8> = (0..8192u32)
         .map(|i| u8::try_from(i % 256).expect("modulo 256 fits in u8"))
         .collect();
     client.send(payload.clone()).await.expect("send");
