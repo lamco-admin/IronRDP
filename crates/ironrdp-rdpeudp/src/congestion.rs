@@ -46,6 +46,14 @@ pub(crate) struct CongestionControl {
     /// Used to limit congestion reaction to once per loss epoch.
     /// CN flags with snSourceAck < cwr_seq are stale and ignored.
     cwr_seq: Option<u64>,
+
+    /// Highest DataSeqNum in flight when the window was last reduced by a
+    /// locally detected loss.
+    ///
+    /// Everything at or below it was already on the wire when the reduction
+    /// happened, so losing it is part of the same event and must not reduce
+    /// the window again.
+    recovery_seq: Option<u64>,
 }
 
 impl CongestionControl {
@@ -61,6 +69,7 @@ impl CongestionControl {
             ssthresh: u64::MAX,
             bytes_acked: 0,
             cwr_seq: None,
+            recovery_seq: None,
         }
     }
 
@@ -116,24 +125,28 @@ impl CongestionControl {
         }
     }
 
-    /// Called when a loss event is detected.
+    /// Called when a packet is declared lost.
     ///
-    /// Halves the congestion window and updates ssthresh.
-    /// Returns `true` if the window was actually reduced (false if
-    /// we already reacted to this loss epoch).
+    /// `loss_seq` is the DataSeqNum of the lost packet and `largest_sent`
+    /// the highest DataSeqNum handed to the network so far.
     ///
-    /// `loss_seq` is the DataSeqNum of the lost packet. If it's below
-    /// the CWR sequence, this loss is from a previous epoch and we
-    /// don't react again.
-    pub(crate) fn on_loss(&mut self, loss_seq: u64) -> bool {
-        // Check if this loss is from the current epoch
-        if let Some(cwr) = self.cwr_seq {
-            if loss_seq < cwr {
-                // Loss from before the most recent CWR: already reacted
+    /// The window is reduced once per recovery epoch, not once per lost
+    /// packet. A burst of loss is one congestion event: everything already
+    /// in flight when the reduction happened belongs to it, so only losing
+    /// something sent afterwards starts a new epoch. Halving per packet
+    /// instead puts the window on its floor after a single burst, and the
+    /// floor is two MTUs.
+    ///
+    /// Returns `true` if the window was actually reduced.
+    pub(crate) fn on_loss(&mut self, loss_seq: u64, largest_sent: u64) -> bool {
+        if let Some(recovery) = self.recovery_seq {
+            if loss_seq <= recovery {
+                // Same congestion event: already reacted.
                 return false;
             }
         }
 
+        self.recovery_seq = Some(largest_sent);
         self.halve_window();
         true
     }
@@ -218,7 +231,7 @@ mod tests {
         let initial = cc.window();
 
         // Loss event
-        cc.on_loss(1);
+        cc.on_loss(1, 1);
         assert!(!cc.in_slow_start()); // ssthresh = window/2 = initial/2, window = ssthresh
         assert_eq!(cc.window(), initial / 2);
         assert_eq!(cc.ssthresh(), initial / 2);
@@ -229,7 +242,7 @@ mod tests {
         let mut cc = CongestionControl::with_initial_window(12320);
 
         // Force into congestion avoidance
-        cc.on_loss(1);
+        cc.on_loss(1, 1);
         let window_after_loss = cc.window(); // 6160
 
         // In congestion avoidance, need to ACK ~cwnd bytes to gain 1 MTU
@@ -243,7 +256,7 @@ mod tests {
     fn window_floor_on_loss() {
         let mut cc = CongestionControl::with_initial_window(MIN_WINDOW);
 
-        cc.on_loss(1);
+        cc.on_loss(1, 1);
         // Window should not drop below MIN_WINDOW
         assert_eq!(cc.window(), MIN_WINDOW);
     }
@@ -253,21 +266,34 @@ mod tests {
         let mut cc = CongestionControl::new();
         let initial = cc.window();
 
-        // First loss
-        assert!(cc.on_loss(5));
+        // First loss, with sequence numbers up to 10 already in flight.
+        assert!(cc.on_loss(5, 10));
         let after_first = cc.window();
         assert_eq!(after_first, initial / 2);
 
-        // Set CWR at seq 10
-        cc.set_cwr_seq(10);
-
-        // Second loss at seq 7 (before CWR) → stale, no reaction
-        assert!(!cc.on_loss(7));
+        // Another packet from that same flight: same event, no reaction.
+        assert!(!cc.on_loss(7, 14));
         assert_eq!(cc.window(), after_first);
 
-        // Third loss at seq 12 (after CWR) → new epoch, react
-        assert!(cc.on_loss(12));
+        // Something sent after the reduction: a new event.
+        assert!(cc.on_loss(12, 20));
         assert_eq!(cc.window(), after_first / 2);
+    }
+
+    /// Losing a burst is one congestion event, not one per packet. Reducing
+    /// per packet puts the window on its floor from a single burst.
+    #[test]
+    fn a_burst_of_loss_reduces_the_window_once() {
+        let mut cc = CongestionControl::new();
+        let initial = cc.window();
+
+        // Ten packets, sequence numbers 1 to 10, all declared lost together.
+        for loss_seq in 1..=10 {
+            cc.on_loss(loss_seq, 10);
+        }
+
+        assert_eq!(cc.window(), initial / 2);
+        assert!(cc.window() > MIN_WINDOW, "the window collapsed to its floor");
     }
 
     #[test]
@@ -311,9 +337,10 @@ mod tests {
     fn repeated_loss_converges_to_floor() {
         let mut cc = CongestionControl::new();
 
+        // Each loss is of a packet sent after the previous reduction, so
+        // each one is its own congestion event.
         for seq in 0..50 {
-            cc.on_loss(seq);
-            cc.set_cwr_seq(seq + 1);
+            cc.on_loss(seq, seq);
         }
 
         assert_eq!(cc.window(), MIN_WINDOW);
@@ -339,8 +366,7 @@ mod tests {
         let initial = cc.window();
 
         // Trigger loss to set ssthresh
-        cc.on_loss(1);
-        cc.set_cwr_seq(2);
+        cc.on_loss(1, 1);
         let ssthresh = cc.ssthresh();
         assert_eq!(ssthresh, initial / 2);
 

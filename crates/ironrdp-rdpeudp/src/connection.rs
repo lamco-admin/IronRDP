@@ -919,19 +919,26 @@ impl RdpeudpConnection {
         let reference = send_window.next_data_seq().saturating_sub(1);
         let acked_seq = seq::reconstruct_seq(ack.seq_num, reference);
 
+        // Time the acknowledged packet before acknowledging it. Resolving an
+        // entry drains it off the front of the window, so looking it up
+        // afterwards finds nothing and no RTT sample is ever taken: the
+        // estimator stays empty and the RTO sits at its initial value for
+        // the life of the connection.
+        //
+        // Karn's algorithm: only packets that went out once can be timed.
+        let elapsed = send_window
+            .get_by_data_seq(acked_seq)
+            .filter(|entry| entry.transmit_count == 1)
+            .map(|entry| now.duration_since(entry.sent_at));
+
         // The ACK seq_num is the highest sequentially received DataSeqNum, so
         // everything at or below it is acknowledged.
         let newly_acked_bytes = send_window.mark_received_through(acked_seq);
 
-        // RTT estimation from ACK timing (Karn's algorithm)
-        // Only use samples from non-retransmitted packets
-        if let Some(entry) = send_window.get_by_data_seq(acked_seq) {
-            if entry.transmit_count == 1 {
-                let ack_gap = Duration::from_millis(u64::from(ack.send_ack_time_gap));
-                let elapsed = now.duration_since(entry.sent_at);
-                if let Some(rtt_sample) = elapsed.checked_sub(ack_gap) {
-                    self.rtt.update(rtt_sample);
-                }
+        if let Some(elapsed) = elapsed {
+            let ack_gap = Duration::from_millis(u64::from(ack.send_ack_time_gap));
+            if let Some(rtt_sample) = elapsed.checked_sub(ack_gap) {
+                self.rtt.update(rtt_sample);
             }
         }
 
@@ -964,11 +971,24 @@ impl RdpeudpConnection {
         let mut current_seq = base;
         let mut newly_acked_bytes: u64 = 0;
 
+        // Timing for the highest packet this vector acknowledges, taken as we
+        // go because resolving an entry drains it out of the window. Karn's
+        // algorithm: only packets that went out once can be timed.
+        let mut elapsed = None;
+
         for entry in &ack_vector.entries {
             match entry {
                 AckVectorEntry::RunLength { received, length } => {
                     for _ in 0..u64::from(*length) {
                         if *received {
+                            if let Some(sample) = send_window
+                                .get_by_data_seq(current_seq)
+                                .filter(|entry| entry.transmit_count == 1)
+                                .map(|entry| now.duration_since(entry.sent_at))
+                            {
+                                elapsed = Some(sample);
+                            }
+
                             if let Some(size) = send_window.mark_received(current_seq) {
                                 newly_acked_bytes += u64::try_from(size).expect("packet size fits in u64");
                             }
@@ -986,6 +1006,14 @@ impl RdpeudpConnection {
                     for bit_pos in 0..7u32 {
                         let received = (bitmap >> bit_pos) & 1 == 1;
                         if received {
+                            if let Some(sample) = send_window
+                                .get_by_data_seq(current_seq)
+                                .filter(|entry| entry.transmit_count == 1)
+                                .map(|entry| now.duration_since(entry.sent_at))
+                            {
+                                elapsed = Some(sample);
+                            }
+
                             if let Some(size) = send_window.mark_received(current_seq) {
                                 newly_acked_bytes += u64::try_from(size).expect("packet size fits in u64");
                             }
@@ -997,20 +1025,10 @@ impl RdpeudpConnection {
         }
 
         // RTT estimation from ACKVEC timing
-        if let (Some(wire_ts), Some(gap_ms)) = (ack_vector.timestamp, ack_vector.send_ack_time_gap_ms) {
-            let _ = wire_ts; // timestamp reconstruction would go here if needed
-            // Use the highest acked seq for RTT if it was a first transmission
-            let highest_acked = send_window.highest_acked_data_seq();
-            if let Some(ha) = highest_acked {
-                if let Some(entry) = send_window.get_by_data_seq(ha) {
-                    if entry.transmit_count == 1 {
-                        let ack_gap = Duration::from_millis(u64::from(gap_ms));
-                        let elapsed = now.duration_since(entry.sent_at);
-                        if let Some(rtt_sample) = elapsed.checked_sub(ack_gap) {
-                            self.rtt.update(rtt_sample);
-                        }
-                    }
-                }
+        if let (Some(elapsed), Some(gap_ms)) = (elapsed, ack_vector.send_ack_time_gap_ms) {
+            let ack_gap = Duration::from_millis(u64::from(gap_ms));
+            if let Some(rtt_sample) = elapsed.checked_sub(ack_gap) {
+                self.rtt.update(rtt_sample);
             }
         }
 
@@ -1115,11 +1133,15 @@ impl RdpeudpConnection {
             return;
         };
 
+        // Read before `mark_lost` drops the entry: this bounds the recovery
+        // epoch, so everything already in flight counts as one loss event.
+        let largest_sent = send_window.next_data_seq().saturating_sub(1);
+
         let Some(info) = send_window.mark_lost(data_seq) else {
             return;
         };
 
-        self.congestion.on_loss(data_seq);
+        self.congestion.on_loss(data_seq, largest_sent);
         self.reliability.enqueue(info.channel_seq, info.data);
 
         // Retransmissions always carry CWR.

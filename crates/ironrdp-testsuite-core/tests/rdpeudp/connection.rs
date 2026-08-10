@@ -771,3 +771,34 @@ fn a_hole_is_never_reported_as_a_cumulative_ack() {
     assert!(packet.header.flags.contains(V2Flags::ACKVEC));
     assert!(!packet.header.flags.contains(V2Flags::ACK));
 }
+
+/// Acknowledging a packet resolves it and drains it off the front of the send
+/// window, so the timing has to be read before that happens. Reading it after
+/// finds nothing, no sample ever reaches the estimator, and the RTO stays at
+/// its initial value for the life of the connection.
+#[test]
+fn an_acknowledgement_produces_an_rtt_sample() {
+    let (mut client, mut server, t) = establish_pair();
+
+    assert!(client.srtt().is_none(), "no samples before any data moves");
+    let initial_rto = client.rto();
+
+    client.send(vec![0xC1; 16]).expect("send");
+    let data = client.poll_transmit(later(t, 100)).expect("data packet");
+
+    let mut bytes = data.contents;
+    server.handle_datagram(&mut bytes, later(t, 140)).expect("handle data");
+
+    // The server's acknowledgment comes back 80ms after the packet went out.
+    server.handle_timeout(later(t, 190));
+    let ack = server.poll_transmit(later(t, 190)).expect("acknowledgment");
+
+    let mut ack_bytes = ack.contents;
+    client
+        .handle_datagram(&mut ack_bytes, later(t, 180))
+        .expect("handle ack");
+
+    let srtt = client.srtt().expect("an RTT sample");
+    assert_eq!(srtt, Duration::from_millis(80));
+    assert_ne!(client.rto(), initial_rto, "the RTO should follow the estimate");
+}
