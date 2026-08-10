@@ -95,6 +95,15 @@ impl RecvWindow {
             return false;
         }
 
+        // The reorder buffer holds at most one entry per window slot. It only
+        // drains when the ChannelSeqNum it is waiting on arrives, so a peer
+        // that keeps sending fresh ones while that packet never comes would
+        // otherwise grow it by one entry per datagram, without bound. Refuse
+        // the packet outright rather than storing it and acknowledging it.
+        if self.reorder_buf.len() >= self.max_entries && !self.reorder_buf.contains_key(&channel_seq) {
+            return false;
+        }
+
         let idx = usize::try_from(index).expect("index within window fits in usize");
 
         // Extend the entries vector if needed.
@@ -370,6 +379,25 @@ mod tests {
     fn ack_vector_empty() {
         let w = RecvWindow::new(1, 100, 6);
         assert!(w.ack_vector().is_empty());
+    }
+
+    /// The reorder buffer is bounded by the window. A peer sending packets
+    /// whose ChannelSeqNum never lets the buffer drain would otherwise add one
+    /// entry per datagram for as long as it cared to keep sending.
+    #[test]
+    fn reorder_buffer_is_bounded_by_the_window() {
+        let window = 1usize << 4;
+        let mut w = RecvWindow::new(1, 1, 4);
+
+        // Every packet arrives except the one the buffer is waiting on, so
+        // nothing can ever be delivered and nothing drains.
+        for offset in 0..window * 4 {
+            let seq = 2 + u64::try_from(offset).expect("offset fits in u64");
+            w.advance_base(seq);
+            w.receive(seq, seq, vec![0xAB]);
+        }
+
+        assert!(w.reorder_buf_len() <= window, "the reorder buffer grew past the window");
     }
 
     #[test]

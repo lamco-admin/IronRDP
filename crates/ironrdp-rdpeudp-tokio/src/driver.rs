@@ -13,13 +13,14 @@
 use crate::clock::Clock;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use std::io;
 use std::sync::{Arc, Mutex};
 
-use ironrdp_rdpeudp::{Event, RdpeudpConnection};
+use ironrdp_rdpeudp::{Event, RdpeudpConnection, RdpeudpError, RdpeudpErrorKind};
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 
-use crate::error::{DriverError, DriverErrorExt as _};
+use crate::error::{DriverError, DriverErrorExt as _, DriverErrorKind};
 use crate::stream::SharedIo;
 
 /// Maximum UDP datagram size we'll attempt to receive.
@@ -66,6 +67,49 @@ impl Driver {
 
     /// Run the driver event loop until the connection closes or errors.
     pub(crate) async fn run(mut self) -> Result<(), DriverError> {
+        let result = self.run_to_completion().await;
+
+        // However this ended, the stream side has to hear about it. A reader
+        // parked in `poll_read` has left its waker here and nothing else will
+        // poll it, so returning an error without coming through here hangs
+        // that task for the life of the process.
+        self.release_stream(result.as_ref().err());
+
+        result
+    }
+
+    /// Mark the shared state closed and wake everything waiting on it.
+    fn release_stream(&self, error: Option<&DriverError>) {
+        let Ok(mut shared) = self.shared.lock() else {
+            // A poisoned lock means the stream side already panicked, and
+            // there is nothing left to wake.
+            return;
+        };
+
+        if let Some(error) = error {
+            let kind = match error.kind() {
+                DriverErrorKind::Socket(io_error) => io_error.kind(),
+                DriverErrorKind::Rdpeudp(_) => io::ErrorKind::InvalidData,
+                DriverErrorKind::ConnectionClosed => io::ErrorKind::ConnectionAborted,
+            };
+            shared.error.get_or_insert(kind);
+        }
+
+        shared.closed = true;
+
+        for waker in [
+            shared.read_waker.take(),
+            shared.write_waker.take(),
+            shared.flush_waker.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            waker.wake();
+        }
+    }
+
+    async fn run_to_completion(&mut self) -> Result<(), DriverError> {
         // Send any initial transmits (the SYN packet for client-side connections)
         self.drain_transmits().await?;
 
@@ -82,10 +126,24 @@ impl Driver {
                 result = self.socket.recv(&mut self.recv_buf) => {
                     let n = result.map_err(|error| DriverError::socket("receive datagram", error))?;
                     let now = self.clock.now();
+
                     // handle_datagram takes &mut [u8] for in-place prefix byte swap
-                    self.conn
-                        .handle_datagram(&mut self.recv_buf[..n], now)
-                        .map_err(|error| DriverError::rdpeudp("handle datagram", error))?;
+                    match self.conn.handle_datagram(&mut self.recv_buf[..n], now) {
+                        Ok(()) => {}
+                        // One datagram the state machine cannot make sense of
+                        // is not grounds for tearing down the connection. UDP
+                        // delivers whatever arrives at the socket, including
+                        // corruption and anything an off-path sender puts
+                        // there, and a peer whose retransmitted handshake
+                        // datagram lands late produces this too. Drop it and
+                        // carry on; a genuinely dead connection still closes
+                        // on the idle timeout.
+                        Err(error) if is_droppable(&error) => {
+                            tracing::debug!(%error, "dropping an unusable datagram");
+                        }
+                        Err(error) => return Err(DriverError::rdpeudp("handle datagram", error)),
+                    }
+
                     self.drain_transmits().await?;
                     self.drain_events();
                 }
@@ -229,11 +287,28 @@ async fn optional_sleep(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// Whether a datagram that the state machine rejected can simply be dropped.
+///
+/// Anything the peer could put on the wire, deliberately or by accident, is
+/// droppable: a malformed packet, a packet that makes no sense in the current
+/// state. What is not droppable is the state machine reporting that this end
+/// is finished, which is a real reason to stop the loop.
+fn is_droppable(error: &RdpeudpError) -> bool {
+    matches!(
+        error.kind(),
+        RdpeudpErrorKind::Decode(_)
+            | RdpeudpErrorKind::Prefix(_)
+            | RdpeudpErrorKind::InvalidPacket { .. }
+            | RdpeudpErrorKind::InvalidState
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
 
     use ironrdp_rdpeudp::ConnectionConfig;
+    use ironrdp_rdpeudp::RdpeudpErrorExt as _;
 
     use super::*;
 
@@ -266,5 +341,55 @@ mod tests {
 
         // Abort the driver (we only needed to test the initial SYN)
         handle.abort();
+    }
+
+    /// Anything the peer can put on the wire is droppable; our own state
+    /// machine telling us this end is finished is not.
+    #[test]
+    fn droppable_errors_are_the_ones_the_peer_controls() {
+        assert!(is_droppable(&RdpeudpError::invalid_packet("test", "malformed")));
+        assert!(!is_droppable(&RdpeudpError::connection_closed("test")));
+    }
+
+    /// A driver that exits on an error has to release the stream side. A
+    /// reader parked in `poll_read` left its waker in the shared state and
+    /// nothing else is going to poll it.
+    #[tokio::test]
+    async fn an_error_exit_wakes_a_parked_reader() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let conn = RdpeudpConnection::connect(ConnectionConfig::default(), Clock::new().now());
+
+        let shared = Arc::new(Mutex::new(SharedIo::new()));
+        let woken = Arc::new(core::sync::atomic::AtomicBool::new(false));
+
+        {
+            let mut guard = shared.lock().expect("lock");
+            guard.read_waker = Some(futures_waker(Arc::clone(&woken)));
+        }
+
+        let driver = Driver::new(socket, conn, Arc::clone(&shared), Arc::new(Notify::new()));
+        driver.release_stream(Some(&DriverError::connection_closed("test")));
+
+        assert!(
+            woken.load(core::sync::atomic::Ordering::SeqCst),
+            "the reader was left parked"
+        );
+
+        let guard = shared.lock().expect("lock");
+        assert!(guard.closed);
+        assert_eq!(guard.error, Some(io::ErrorKind::ConnectionAborted));
+    }
+
+    /// Build a waker that records having been woken.
+    fn futures_waker(flag: Arc<core::sync::atomic::AtomicBool>) -> core::task::Waker {
+        struct Flag(Arc<core::sync::atomic::AtomicBool>);
+
+        impl std::task::Wake for Flag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        core::task::Waker::from(Arc::new(Flag(flag)))
     }
 }
