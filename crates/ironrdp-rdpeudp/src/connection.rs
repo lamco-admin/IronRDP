@@ -971,7 +971,7 @@ impl RdpeudpConnection {
 
     /// Process a v2 wire-format packet (with prefix byte framing).
     fn handle_v2_packet(&mut self, wire: &mut [u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
-        let (_prefix, packet_bytes) = decode_with_prefix(wire).map_err(RdpeudpError::prefix)?;
+        let (prefix, packet_bytes) = decode_with_prefix(wire).map_err(RdpeudpError::prefix)?;
 
         let packet: V2Packet = decode(packet_bytes).map_err(RdpeudpError::decode)?;
 
@@ -1003,7 +1003,16 @@ impl RdpeudpConnection {
 
         // Process data payload
         if let (Some(dh), Some(db)) = (&packet.data_header, &packet.data_body) {
-            self.process_data(dh, db, now);
+            if prefix.is_dummy() {
+                // [MS-RDPEUDP2] 3.1.1.1.5: a dummy packet "is treated as a
+                // normal RDP-UDP2 packet by the UDP transport", so it still
+                // occupies its sequence number and gets acknowledged, but
+                // "the contents MUST be ignored by higher layers using the
+                // UDP transport".
+                self.process_dummy_data(dh, now);
+            } else {
+                self.process_data(dh, db, now);
+            }
         }
 
         Ok(())
@@ -1178,6 +1187,37 @@ impl RdpeudpConnection {
     }
 
     /// Process received data.
+    /// Account for a dummy packet without handing anything to the
+    /// application.
+    ///
+    /// [MS-RDPEUDP2] 3.1.1.1.5 keeps the transport's view of a dummy packet
+    /// ordinary: it fills its slot in the receive window and is acknowledged,
+    /// which is what lets the sender see it arrive. Only the contents are
+    /// off limits.
+    fn process_dummy_data(&mut self, dh: &DataHeader, now: MonotonicInstant) {
+        let Some(recv_window) = self.recv_window.as_mut() else {
+            return;
+        };
+
+        let reference = recv_window.highest_seq();
+        let data_seq = seq::reconstruct_seq(dh.data_seq_num, reference);
+
+        if !recv_window.receive_without_payload(data_seq) {
+            return;
+        }
+
+        let has_gaps = recv_window.has_gaps();
+
+        if has_gaps {
+            self.cn_pending = true;
+        }
+
+        self.ack_pending = true;
+        if !self.timers.is_set(Timer::AckDelay) {
+            self.timers.set(Timer::AckDelay, now + self.config.ack_delay_timeout);
+        }
+    }
+
     fn process_data(&mut self, dh: &DataHeader, db: &DataBody, now: MonotonicInstant) {
         let recv_window = match self.recv_window.as_mut() {
             Some(rw) => rw,
@@ -1610,7 +1650,10 @@ impl RdpeudpConnection {
     /// Encode a V2 packet with the PacketPrefixByte framing.
     fn encode_v2_packet(&mut self, packet: &V2Packet) -> Option<Transmit> {
         let packet_bytes = encode_vec(packet).ok()?;
-        let is_dummy = packet.header.flags.contains(V2Flags::DUMMY);
+        // We never originate dummy packets. They exist for a sender that wants
+        // to probe or pad without giving the higher layer anything to read,
+        // and this transport has no use for that.
+        let is_dummy = false;
 
         self.wire_buf.clear();
         encode_with_prefix(&packet_bytes, is_dummy, &mut self.wire_buf).ok()?;

@@ -39,12 +39,12 @@ bitflags! {
 
         /// DelayAckInfo payload (Section 2.2.1.2.3) is present.
         const DELAYACKINFO = 0x100;
-
-        /// Dummy packet: loss of this packet must not trigger retransmit.
-        /// Contents must be ignored by higher layers.
-        const DUMMY = 0x200;
     }
 }
+
+// There is no DUMMY flag here on purpose. A dummy packet is marked by
+// Packet_Type_Index 8 in the PacketPrefixByte, not in this header; see
+// [MS-RDPEUDP2] 3.1.1.1.5 and `crate::pdu::prefix`.
 
 impl V2Flags {
     /// Mask for the 12-bit flags field within the 16-bit header word.
@@ -71,7 +71,6 @@ mod tests {
         assert_eq!(V2Flags::OVERHEADSIZE.bits(), 0x040);
         assert_eq!(V2Flags::CWR.bits(), 0x080);
         assert_eq!(V2Flags::DELAYACKINFO.bits(), 0x100);
-        assert_eq!(V2Flags::DUMMY.bits(), 0x200);
     }
 
     #[test]

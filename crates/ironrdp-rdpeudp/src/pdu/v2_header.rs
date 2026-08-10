@@ -184,18 +184,19 @@ mod tests {
 
     #[test]
     fn flags_only_lower_12_bits() {
-        // V2Flags only defines bits at specific positions: 0x001, 0x004,
-        // 0x008, 0x010, 0x020, 0x040, 0x080, 0x100, 0x200 = 0x3FD.
+        // The six flags [MS-RDPEUDP2] 2.2.1.1 defines, plus the CN and CWR
+        // this crate carries over from the v1 header: 0x001, 0x004, 0x008,
+        // 0x010, 0x020, 0x040, 0x080, 0x100 = 0x1FD.
         // from_bits_truncate drops undefined bit positions.
         let all_defined = V2Flags::all();
-        assert_eq!(all_defined.bits(), 0x3FD);
+        assert_eq!(all_defined.bits(), 0x1FD);
 
         let header = V2Header {
             flags: all_defined,
             log_window_size: 0xF,
         };
         let wire = header.to_wire();
-        assert_eq!(wire, 0xF3FD); // 0x3FD | (0xF << 12)
+        assert_eq!(wire, 0xF1FD); // 0x1FD | (0xF << 12)
 
         // Can't decode all_defined because ACK and ACKVEC are both set.
         // Test with valid flags to verify the bit separation.

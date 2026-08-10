@@ -83,18 +83,6 @@ impl RecvWindow {
     /// ChannelSeqNum-ordered reassembly. Returns `true` if this is a
     /// new packet (not a duplicate).
     pub(crate) fn receive(&mut self, data_seq: u64, channel_seq: u64, data: Vec<u8>) -> bool {
-        // Ignore packets below the window base (already processed).
-        if data_seq < self.base_seq {
-            return false;
-        }
-
-        let index = data_seq - self.base_seq;
-
-        // Ignore packets beyond the window limit.
-        if index >= u64::try_from(self.max_entries).expect("max_entries fits in u64") {
-            return false;
-        }
-
         // A ChannelSeqNum below the delivery cursor belongs to data the
         // application has already seen, so this is a retransmission of
         // something we no longer need. Acknowledge it, so the sender stops
@@ -122,6 +110,45 @@ impl RecvWindow {
             return false;
         }
 
+        if !self.occupy_slot(data_seq, Some(channel_seq)) {
+            return false;
+        }
+
+        // Buffer data for reassembly by ChannelSeqNum.
+        if !already_delivered {
+            self.reorder_buf.insert(channel_seq, data);
+        }
+
+        true
+    }
+
+    /// Record a DataSeqNum as received while taking nothing from the packet.
+    ///
+    /// This is a dummy packet. [MS-RDPEUDP2] 3.1.1.1.5 has the transport treat
+    /// one "as a normal RDP-UDP2 packet", so it occupies its sequence number
+    /// and is acknowledged like any other, but "the contents MUST be ignored
+    /// by higher layers", which includes the ChannelSeqNum it carries: that
+    /// number belongs to no real datum and reassembling around it would leave
+    /// the delivery cursor waiting on data no one will ever send.
+    pub(crate) fn receive_without_payload(&mut self, data_seq: u64) -> bool {
+        self.occupy_slot(data_seq, None)
+    }
+
+    /// Mark a slot received, returning whether this is new rather than a
+    /// duplicate or a packet outside the window.
+    fn occupy_slot(&mut self, data_seq: u64, channel_seq: Option<u64>) -> bool {
+        // Ignore packets below the window base (already processed).
+        if data_seq < self.base_seq {
+            return false;
+        }
+
+        let index = data_seq - self.base_seq;
+
+        // Ignore packets beyond the window limit.
+        if index >= u64::try_from(self.max_entries).expect("max_entries fits in u64") {
+            return false;
+        }
+
         let idx = usize::try_from(index).expect("index within window fits in usize");
 
         // Extend the entries vector if needed.
@@ -139,15 +166,10 @@ impl RecvWindow {
 
         // Mark as received.
         self.entries[idx].state = RecvEntryState::Received;
-        self.entries[idx].channel_seq = Some(channel_seq);
+        self.entries[idx].channel_seq = channel_seq;
 
         if data_seq > self.highest_seq {
             self.highest_seq = data_seq;
-        }
-
-        // Buffer data for reassembly by ChannelSeqNum.
-        if !already_delivered {
-            self.reorder_buf.insert(channel_seq, data);
         }
 
         true

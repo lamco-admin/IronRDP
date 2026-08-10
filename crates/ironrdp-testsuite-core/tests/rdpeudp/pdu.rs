@@ -678,7 +678,7 @@ fn v2_flags_auto_computed_on_encode() {
     assert!(!decoded.header.flags.contains(V2Flags::ACKVEC));
 }
 
-/// Standalone flags (CN, CWR, DUMMY) are preserved on encode.
+/// Standalone flags (CN, CWR) are preserved on encode.
 #[test]
 fn v2_standalone_flags_preserved() {
     let packet = V2Packet {
@@ -886,31 +886,20 @@ fn v2_ackvec_with_data_roundtrip() {
     assert_eq!(decoded, packet);
 }
 
-/// Dummy packet with DATA.
+/// The v2 header defines exactly six flags.
+///
+/// [MS-RDPEUDP2] 2.2.1.1 lists ACK, DATA, ACKVEC, AOA, OVERHEADSIZE and
+/// DELAYACKINFO, and nothing else. In particular there is no DUMMY flag: a
+/// dummy packet is marked by Packet_Type_Index 8 in the PacketPrefixByte
+/// (3.1.1.1.5), one layer down.
 #[test]
-fn v2_dummy_packet_roundtrip() {
-    let packet = V2Packet {
-        header: V2Header {
-            flags: V2Flags::DATA | V2Flags::DUMMY,
-            log_window_size: 6,
-        },
-        ack: None,
-        overhead_size: None,
-        delay_ack_info: None,
-        ack_of_acks: None,
-        data_header: Some(DataHeader { data_seq_num: 99 }),
-        ack_vector: None,
-        data_body: Some(DataBody {
-            channel_seq_num: 50,
-            data: vec![0x00; 10],
-        }),
-    };
-
-    let encoded = encode_vec(&packet).expect("encode");
-    let decoded: V2Packet = decode(&encoded).expect("decode");
-
-    assert!(decoded.header.flags.contains(V2Flags::DUMMY));
-    assert_eq!(decoded, packet);
+fn v2_header_flags_match_the_spec_table() {
+    assert_eq!(V2Flags::ACK.bits(), 0x001);
+    assert_eq!(V2Flags::DATA.bits(), 0x004);
+    assert_eq!(V2Flags::ACKVEC.bits(), 0x008);
+    assert_eq!(V2Flags::AOA.bits(), 0x010);
+    assert_eq!(V2Flags::OVERHEADSIZE.bits(), 0x040);
+    assert_eq!(V2Flags::DELAYACKINFO.bits(), 0x100);
 }
 
 /// Near-MTU data packet.

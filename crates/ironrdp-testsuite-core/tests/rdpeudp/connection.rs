@@ -1003,3 +1003,124 @@ fn a_transfer_survives_a_loss_in_the_middle() {
         assert_eq!(chunk, &vec![byte; 4], "chunk {i} arrived out of order");
     }
 }
+
+// ── Dummy packets ──
+//
+// [MS-RDPEUDP2] 3.1.1.1.5: "If Packet_Type_Index is set to 8, then a dummy
+// packet follows the PacketPrefixByte. A dummy packet is treated as a normal
+// RDP-UDP2 packet by the UDP transport. However, loss of this packet MUST not
+// generate a retransmit. In addition, the contents MUST be ignored by higher
+// layers using the UDP transport."
+
+/// Re-frame a v2 packet as a dummy, which is a property of the prefix byte
+/// rather than anything in the header.
+fn as_dummy(transmit: Transmit) -> Vec<u8> {
+    let mut bytes = transmit.contents;
+    let (_, packet) = decode_with_prefix(&mut bytes).expect("prefix");
+    let packet = packet.to_vec();
+
+    let mut wire = Vec::new();
+    encode_with_prefix(&packet, true, &mut wire).expect("re-frame as dummy");
+    wire
+}
+
+#[test]
+fn a_dummy_packets_contents_never_reach_the_application() {
+    let (mut client, mut server, t) = establish_pair();
+
+    client.send(vec![0xD0; 16]).expect("send");
+    let data = client.poll_transmit(later(t, 100)).expect("data packet");
+
+    let mut dummy = as_dummy(data);
+    server.handle_datagram(&mut dummy, later(t, 150)).expect("handle dummy");
+
+    assert!(
+        drain_received(&mut server).is_empty(),
+        "the contents of a dummy packet must be ignored by higher layers"
+    );
+}
+
+/// The transport still accounts for a dummy, because 3.1.1.1.5 has it
+/// "treated as a normal RDP-UDP2 packet by the UDP transport". Its sequence
+/// number is filled and acknowledged like any other, so the sender is not left
+/// retransmitting it forever.
+#[test]
+fn a_dummy_packet_is_still_acknowledged() {
+    let (mut client, mut server, t) = establish_pair();
+
+    client.send(vec![0xD0; 16]).expect("send");
+    let data = client.poll_transmit(later(t, 100)).expect("data packet");
+
+    let mut dummy = as_dummy(data);
+    server.handle_datagram(&mut dummy, later(t, 150)).expect("handle dummy");
+
+    // The delayed-ACK timer is the sign the transport took it as a real packet.
+    let deadline = server.poll_timeout().expect("a timer is armed");
+    server.handle_timeout(deadline);
+    let ack = server.poll_transmit(deadline).expect("an acknowledgment");
+
+    let mut ack_bytes = ack.contents;
+    let (_, packet_bytes) = decode_with_prefix(&mut ack_bytes).expect("prefix");
+    let packet: V2Packet = decode(packet_bytes).expect("decode");
+
+    assert!(
+        packet.ack.is_some() || packet.ack_vector.is_some(),
+        "a dummy packet should still be acknowledged"
+    );
+}
+
+/// A dummy carries a ChannelSeqNum that belongs to no real datum, so taking it
+/// into reassembly would leave the delivery cursor waiting on data nobody will
+/// ever send. Real data on either side of it must still flow.
+#[test]
+fn a_dummy_does_not_disturb_the_channel_sequence() {
+    let (mut client, mut server, t) = establish_pair();
+
+    client.send(vec![0xA1; 8]).expect("send");
+    let mut first = client.poll_transmit(later(t, 100)).expect("first data packet").contents;
+    server.handle_datagram(&mut first, later(t, 110)).expect("handle data");
+    assert_eq!(drain_received(&mut server), vec![vec![0xA1; 8]]);
+
+    // A synthetic dummy, which is what a real sender emits: it takes a
+    // DataSeqNum of its own and its ChannelSeqNum names nothing.
+    let dummy = V2Packet {
+        header: V2Header {
+            flags: V2Flags::DATA,
+            log_window_size: 6,
+        },
+        ack: None,
+        overhead_size: None,
+        delay_ack_info: None,
+        ack_of_acks: None,
+        data_header: Some(DataHeader { data_seq_num: 150 }),
+        ack_vector: None,
+        data_body: Some(DataBody {
+            channel_seq_num: 900,
+            data: vec![0xFF; 8],
+        }),
+    };
+
+    let encoded = encode_vec(&dummy).expect("encode");
+    let mut wire = Vec::new();
+    encode_with_prefix(&encoded, true, &mut wire).expect("prefix as dummy");
+    server.handle_datagram(&mut wire, later(t, 120)).expect("handle dummy");
+
+    assert!(
+        drain_received(&mut server).is_empty(),
+        "the contents of a dummy packet must be ignored"
+    );
+
+    // Real data keeps flowing behind it.
+    client.send(vec![0xA2; 8]).expect("send");
+    let mut second = client
+        .poll_transmit(later(t, 130))
+        .expect("second data packet")
+        .contents;
+    server.handle_datagram(&mut second, later(t, 140)).expect("handle data");
+
+    assert_eq!(
+        drain_received(&mut server),
+        vec![vec![0xA2; 8]],
+        "a dummy must not disturb the channel sequence"
+    );
+}
