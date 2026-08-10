@@ -14,6 +14,7 @@ categories.workspace = true
 
 [lib]
 doctest = false
+# test = false # FIXME: turn off and keep tests in testsuite crates
 
 [features]
 # Matches `ironrdp-pdu` and `ironrdp-rdpeusb`: `no_std` unless a consumer asks
@@ -22,8 +23,12 @@ doctest = false
 # feature is offered.
 default = []
 std = ["ironrdp-core/std", "ironrdp-error/std"]
+# Structure-aware fuzzing support, mirroring `ironrdp-pdu`.
+# `arbitrary` needs the standard library, so structure-aware fuzzing implies `std`.
+arbitrary = ["dep:arbitrary", "std"]
 
 [dependencies]
+arbitrary = { version = "1", features = ["derive"], optional = true }
 ironrdp-core = { path = "../ironrdp-core", version = "0.2", features = ["alloc"] } # public
 ironrdp-error = { path = "../ironrdp-error", version = "0.2", features = ["alloc"] } # public
 

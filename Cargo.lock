@@ -2770,6 +2770,8 @@ dependencies = [
  "ironrdp-graphics",
  "ironrdp-pdu",
  "ironrdp-rdpdr",
+ "ironrdp-rdpemt",
+ "ironrdp-rdpeudp",
  "ironrdp-rdpsnd",
  "ironrdp-svc",
 ]
@@ -2898,6 +2900,7 @@ dependencies = [
 name = "ironrdp-rdpemt"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "ironrdp-core 0.2.1",
  "ironrdp-error 0.2.0",
 ]
@@ -2906,6 +2909,7 @@ dependencies = [
 name = "ironrdp-rdpeudp"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "bitflags 2.13.1",
  "ironrdp-core 0.2.1",
  "ironrdp-error 0.2.0",
@@ -2921,7 +2925,6 @@ dependencies = [
  "ironrdp-error 0.2.0",
  "ironrdp-rdpemt",
  "ironrdp-rdpeudp",
- "rcgen",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -3086,6 +3089,8 @@ dependencies = [
  "ironrdp-propertyset",
  "ironrdp-rdcleanpath",
  "ironrdp-rdpdr",
+ "ironrdp-rdpemt",
+ "ironrdp-rdpeudp",
  "ironrdp-rdpeusb",
  "ironrdp-rdpfile",
  "ironrdp-rdpsnd",
@@ -3120,14 +3125,19 @@ dependencies = [
  "ironrdp-dvc-pipe-proxy",
  "ironrdp-input",
  "ironrdp-propertyset",
+ "ironrdp-rdpemt",
+ "ironrdp-rdpeudp",
+ "ironrdp-rdpeudp-tokio",
  "ironrdp-rpc",
  "ironrdp-svc",
  "ironrdp-tls",
  "ironrdp-tokio",
  "ironrdp-viewer",
  "ironrdp-vmconnect",
+ "rcgen",
  "semver",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "uuid",

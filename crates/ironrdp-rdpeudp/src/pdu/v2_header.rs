@@ -10,6 +10,7 @@ use super::v2_flags::V2Flags;
 /// Maximum value for LogWindowSize (4-bit field).
 pub const LOG_WINDOW_SIZE_MAX: u8 = 15;
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Mandatory header for every RDP-UDP2 packet.
 ///
 /// MS-RDPEUDP2 Section 2.2.1.1.

@@ -146,7 +146,6 @@ impl MultitransportBootstrap {
 
 #[cfg(test)]
 mod tests {
-    use ironrdp_rdpemt::TunnelConfig;
 
     use super::*;
 
@@ -158,7 +157,7 @@ mod tests {
             security_cookie: [0xAB; 16],
         };
 
-        let bootstrap = MultitransportBootstrap::new(request.clone());
+        let bootstrap = MultitransportBootstrap::new(request);
         assert_eq!(bootstrap.request().request_id, 42);
         assert!(!bootstrap.is_connected());
         assert!(bootstrap.response_pdu().is_none());
@@ -192,7 +191,7 @@ mod tests {
             security_cookie: [0xDD; 16],
         };
 
-        let config: TunnelConfig = request.to_tunnel_config();
+        let config = request.to_tunnel_config();
         assert_eq!(config.request_id, 7);
         assert_eq!(config.security_cookie, [0xDD; 16]);
     }

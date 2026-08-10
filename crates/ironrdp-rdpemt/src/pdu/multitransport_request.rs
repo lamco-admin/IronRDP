@@ -23,6 +23,7 @@ use crate::pdu::create_request::SECURITY_COOKIE_LEN;
 /// Total payload size: RequestID(4) + RequestedProtocol(2) + Reserved(2) + Cookie(16).
 const WIRE_SIZE: usize = 4 + 2 + 2 + SECURITY_COOKIE_LEN;
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Requested transport protocol for multitransport bootstrapping.
 ///
 /// MS-RDPBCGR §2.2.15.1: `requestedProtocol` field.
@@ -52,6 +53,7 @@ impl RequestedProtocol {
     }
 }
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Server Initiate Multitransport Request PDU payload.
 ///
 /// Sent by the server on the MCS message channel after licensing.

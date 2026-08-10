@@ -14,6 +14,7 @@ const PREFIX_SWAP_INDEX: usize = 7;
 /// Minimum wire payload size. Packets shorter than this are padded.
 const MIN_WIRE_SIZE: usize = 8; // 1 byte prefix + 7 bytes minimum
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// PacketPrefixByte structure.
 ///
 /// MS-RDPEUDP2 Section 2.2.1.3.
@@ -82,6 +83,7 @@ impl PacketPrefixByte {
     }
 }
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Error returned by prefix encoding/decoding operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefixError {
@@ -321,7 +323,7 @@ mod tests {
         // Decode
         let (prefix, decoded_packet) = decode_with_prefix(&mut wire_buf).expect("decode");
         assert!(!prefix.is_dummy());
-        assert_eq!(decoded_packet, &packet[..]);
+        assert_eq!(decoded_packet, &*packet);
     }
 
     #[test]
@@ -332,7 +334,7 @@ mod tests {
 
         let (prefix, decoded_packet) = decode_with_prefix(&mut wire_buf).expect("decode");
         assert!(prefix.is_dummy());
-        assert_eq!(decoded_packet, &packet[..]);
+        assert_eq!(decoded_packet, &*packet);
     }
 
     #[test]
@@ -347,7 +349,7 @@ mod tests {
 
         let (prefix, decoded_packet) = decode_with_prefix(&mut wire_buf).expect("decode");
         assert_eq!(prefix.short_packet_length, 3);
-        assert_eq!(decoded_packet, &packet[..]);
+        assert_eq!(decoded_packet, &*packet);
     }
 
     #[test]
@@ -359,7 +361,7 @@ mod tests {
 
         let (prefix, decoded_packet) = decode_with_prefix(&mut wire_buf).expect("decode");
         assert_eq!(prefix.short_packet_length, 2);
-        assert_eq!(decoded_packet, &packet[..]);
+        assert_eq!(decoded_packet, &*packet);
     }
 
     #[test]
@@ -372,13 +374,15 @@ mod tests {
     #[test]
     fn roundtrip_large_packet() {
         // Near-MTU packet
-        let packet: Vec<u8> = (0..1200).map(|i| (i % 256) as u8).collect();
+        let packet: Vec<u8> = (0..1200u32)
+            .map(|i| u8::try_from(i % 256).expect("modulo 256 fits in u8"))
+            .collect();
         let mut wire_buf = Vec::new();
         encode_with_prefix(&packet, false, &mut wire_buf).expect("encode");
 
         let (prefix, decoded_packet) = decode_with_prefix(&mut wire_buf).expect("decode");
         assert!(!prefix.is_dummy());
         assert_eq!(prefix.short_packet_length, 7);
-        assert_eq!(decoded_packet, &packet[..]);
+        assert_eq!(decoded_packet, &*packet);
     }
 }

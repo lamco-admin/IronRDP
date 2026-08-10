@@ -11,6 +11,7 @@ bitflags! {
     ///
     /// MS-RDPEUDP Section 2.2.2.1.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
     pub struct V1Flags: u16 {
         /// SYN: connection initialization.
         const SYN = 0x0001;

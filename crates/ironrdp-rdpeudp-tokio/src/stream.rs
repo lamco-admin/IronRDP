@@ -189,24 +189,24 @@ mod tests {
 
     /// Minimal waker that tracks whether it was woken.
     struct TestWaker {
-        woken: std::sync::atomic::AtomicBool,
+        woken: core::sync::atomic::AtomicBool,
     }
 
     impl TestWaker {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                woken: std::sync::atomic::AtomicBool::new(false),
+                woken: core::sync::atomic::AtomicBool::new(false),
             })
         }
 
         fn was_woken(&self) -> bool {
-            self.woken.load(std::sync::atomic::Ordering::SeqCst)
+            self.woken.load(core::sync::atomic::Ordering::SeqCst)
         }
     }
 
     impl Wake for TestWaker {
         fn wake(self: Arc<Self>) {
-            self.woken.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.woken.store(true, core::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -226,10 +226,10 @@ mod tests {
         let shared = Arc::new(Mutex::new(SharedIo::new()));
         {
             let mut s = shared.lock().expect("lock");
-            s.write_waker = Some(Waker::from(driver_waker.clone()));
+            s.write_waker = Some(Waker::from(Arc::clone(&driver_waker)));
         }
 
-        let mut stream = RdpeudpStream::new(shared.clone());
+        let mut stream = RdpeudpStream::new(Arc::clone(&shared));
 
         let rt = tokio::runtime::Builder::new_current_thread().build().expect("rt");
         rt.block_on(async {
@@ -237,7 +237,7 @@ mod tests {
         });
 
         let s = shared.lock().expect("lock");
-        assert_eq!(&s.write_buf[..], b"hello");
+        assert_eq!(&*s.write_buf, b"hello");
         assert!(driver_waker.was_woken());
     }
 
@@ -297,10 +297,10 @@ mod tests {
     #[test]
     fn read_registers_waker_when_empty() {
         let shared = Arc::new(Mutex::new(SharedIo::new()));
-        let mut stream = RdpeudpStream::new(shared.clone());
+        let mut stream = RdpeudpStream::new(Arc::clone(&shared));
 
         let test_waker = TestWaker::new();
-        let waker = Waker::from(test_waker.clone());
+        let waker = Waker::from(Arc::clone(&test_waker));
         let mut cx = Context::from_waker(&waker);
 
         let mut buf = [0u8; 32];

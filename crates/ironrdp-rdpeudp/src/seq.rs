@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn seq_roundtrip() {
-        let original = 0x1_0042_u64;
+        let original = 0x1_0042u64;
         let wire = truncate_seq(original);
         let reference = 0x1_0040;
         let reconstructed = reconstruct_seq(wire, reference);
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn seq_roundtrip_across_wrap() {
-        let original = 0x2_0005_u64;
+        let original = 0x2_0005u64;
         let wire = truncate_seq(original); // 0x0005
         let reference = 0x1_FFFA;
         let reconstructed = reconstruct_seq(wire, reference);
@@ -217,16 +217,16 @@ mod tests {
 
     #[test]
     fn reconstruct_ts_nearby() {
-        let reference = 0x100_0500_u64; // well above 24-bit range
-        let wire = 0x00_0510_u32;
+        let reference = 0x100_0500u64; // well above 24-bit range
+        let wire = 0x00_0510u32;
         assert_eq!(reconstruct_timestamp(wire, reference), 0x100_0510);
     }
 
     #[test]
     fn reconstruct_ts_wrap_forward() {
         // Reference near the end of a 24-bit epoch, wire wraps to next
-        let reference = 0x00FF_FFFE_u64;
-        let wire = 0x00_0002_u32;
+        let reference = 0x00FF_FFFEu64;
+        let wire = 0x00_0002u32;
         assert_eq!(
             reconstruct_timestamp(wire, reference),
             0x0100_0002 // next epoch
@@ -236,8 +236,8 @@ mod tests {
     #[test]
     fn reconstruct_ts_wrap_backward() {
         // Reference in new epoch, wire from previous
-        let reference = 0x0100_0002_u64;
-        let wire = 0x00FF_FFFE_u32;
+        let reference = 0x0100_0002u64;
+        let wire = 0x00FF_FFFEu32;
         assert_eq!(
             reconstruct_timestamp(wire, reference),
             0x00FF_FFFE // previous epoch
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn ts_roundtrip() {
-        let original = 0x100_5000_u64;
+        let original = 0x100_5000u64;
         let wire = truncate_timestamp(original);
         let reference = 0x100_4FFF;
         let reconstructed = reconstruct_timestamp(wire, reference);
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn ts_roundtrip_across_wrap() {
-        let original = 0x200_0010_u64;
+        let original = 0x200_0010u64;
         let wire = truncate_timestamp(original); // 0x00_0010
         let reference = 0x1FF_FFF0;
         let reconstructed = reconstruct_timestamp(wire, reference);

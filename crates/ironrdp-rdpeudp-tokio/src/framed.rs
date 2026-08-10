@@ -75,7 +75,7 @@ mod tests {
         let mut buf = BytesMut::new();
         let n = FramedRead::read(&mut transport, &mut buf).await.unwrap();
         assert_eq!(n, 4);
-        assert_eq!(&buf[..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(&*buf, &[0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[tokio::test]
@@ -122,10 +122,10 @@ mod tests {
 
         let n1 = FramedRead::read(&mut transport, &mut buf).await.unwrap();
         assert_eq!(n1, 2);
-        assert_eq!(&buf[..], &[0xAA, 0xBB]);
+        assert_eq!(&*buf, &[0xAA, 0xBB]);
 
         let n2 = FramedRead::read(&mut transport, &mut buf).await.unwrap();
         assert_eq!(n2, 2);
-        assert_eq!(&buf[..], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(&*buf, &[0xAA, 0xBB, 0xCC, 0xDD]);
     }
 }

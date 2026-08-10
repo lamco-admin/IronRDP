@@ -231,7 +231,7 @@ async fn optional_sleep(deadline: Option<tokio::time::Instant>) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use core::time::Duration;
 
     use ironrdp_rdpeudp::ConnectionConfig;
 

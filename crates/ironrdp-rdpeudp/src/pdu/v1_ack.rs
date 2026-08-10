@@ -9,6 +9,7 @@ use ironrdp_core::{Decode, DecodeResult, Encode, EncodeResult, ReadCursor, Write
 
 // -- ACK Vector Element --
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// State of a received packet in the ACK vector.
 ///
 /// MS-RDPEUDP Section 2.2.2.7.1: each element is 1 byte,
@@ -44,6 +45,7 @@ impl V1AckVectorElement {
 
 // -- RDPUDP_ACK_VECTOR_HEADER --
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// ACK vector describing the state of the receiver's packet queue.
 ///
 /// MS-RDPEUDP Section 2.2.2.7.
@@ -106,6 +108,7 @@ impl Decode<'_> for V1AckVectorHeader {
 
 // -- RDPUDP_ACK_OF_ACKVECTOR_HEADER --
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Resets the starting position of ACK vector encoding at the receiver.
 ///
 /// MS-RDPEUDP Section 2.2.2.6.
@@ -152,6 +155,7 @@ impl Decode<'_> for V1AckOfAcksHeader {
 
 // -- RDPUDP_CORRELATION_ID_PAYLOAD --
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Correlation ID for diagnostic binding between TCP and UDP connections.
 ///
 /// MS-RDPEUDP Section 2.2.2.8.

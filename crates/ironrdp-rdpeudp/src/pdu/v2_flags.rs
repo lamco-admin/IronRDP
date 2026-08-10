@@ -12,6 +12,7 @@ bitflags! {
     /// Stored in the lower 12 bits of the 16-bit header word.
     /// The upper 4 bits are `LogWindowSize`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
     pub struct V2Flags: u16 {
         /// ACK payload (Section 2.2.1.2.1) is present.
         /// Mutually exclusive with ACKVEC.

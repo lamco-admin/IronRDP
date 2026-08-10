@@ -7,8 +7,8 @@
 //! These tests use `multi_thread` flavor because they perform real
 //! UDP I/O, which conflicts with tokio's mock clock (test-util).
 
+use core::time::Duration;
 use std::sync::Arc;
-use std::time::Duration;
 
 use ironrdp_rdpemt::TunnelConfig;
 use ironrdp_rdpeudp::ConnectionConfig;
@@ -132,8 +132,9 @@ async fn full_stack_larger_payload() {
     let (client, mut server) = establish_loopback_pair().await;
 
     // ~1 KB payload -- within a single RDPEUDP2 segment
-    #[expect(clippy::cast_possible_truncation, reason = "i % 256 fits in u8")]
-    let payload: Vec<u8> = (0..1000).map(|i: usize| (i % 256) as u8).collect();
+    let payload: Vec<u8> = (0..1000u32)
+        .map(|i| u8::try_from(i % 256).expect("modulo 256 fits in u8"))
+        .collect();
     client.send(payload.clone()).await.expect("send");
 
     let received = server.recv().await.expect("recv");

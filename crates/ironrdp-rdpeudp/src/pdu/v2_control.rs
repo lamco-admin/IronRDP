@@ -7,6 +7,7 @@ use ironrdp_core::{Decode, DecodeResult, Encode, EncodeResult, ReadCursor, Write
 
 // ── OverheadSize Payload ──
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Average extra header bytes from the RDP-UDP2 layer to the raw UDP layer.
 ///
 /// MS-RDPEUDP2 Section 2.2.1.2.2.
@@ -52,6 +53,7 @@ impl Decode<'_> for OverheadSizePayload {
 
 // ── DelayAckInfo Payload ──
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Parameters controlling the Receiver's ACK batching behavior.
 ///
 /// MS-RDPEUDP2 Section 2.2.1.2.3.
@@ -126,6 +128,7 @@ impl Decode<'_> for DelayAckInfoPayload {
 
 // ── AckOfAcks Payload ──
 
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// Tells the Receiver the lowest sequence number the Sender still cares about.
 ///
 /// MS-RDPEUDP2 Section 2.2.1.2.4.
@@ -170,142 +173,5 @@ impl Decode<'_> for AckOfAcksPayload {
         ironrdp_core::ensure_fixed_part_size!(in: src);
         let ack_of_acks_seq_num = src.read_u16();
         Ok(Self { ack_of_acks_seq_num })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use ironrdp_core::{decode, encode_vec};
-
-    use super::*;
-
-    // ── OverheadSize tests ──
-
-    #[test]
-    fn overhead_size_roundtrip() {
-        let original = OverheadSizePayload { overhead_size: 42 };
-        let encoded = encode_vec(&original).expect("encode");
-        assert_eq!(encoded.as_slice(), &[42]);
-        assert_eq!(original.size(), 1);
-
-        let decoded: OverheadSizePayload = decode(&encoded).expect("decode");
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn overhead_size_zero() {
-        let original = OverheadSizePayload { overhead_size: 0 };
-        let encoded = encode_vec(&original).expect("encode");
-        let decoded: OverheadSizePayload = decode(&encoded).expect("decode");
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn overhead_size_max() {
-        let original = OverheadSizePayload { overhead_size: 0xFF };
-        let encoded = encode_vec(&original).expect("encode");
-        let decoded: OverheadSizePayload = decode(&encoded).expect("decode");
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn overhead_size_insufficient_bytes() {
-        let bytes: [u8; 0] = [];
-        let result: DecodeResult<OverheadSizePayload> = decode(&bytes);
-        assert!(result.is_err());
-    }
-
-    // ── DelayAckInfo tests ──
-
-    #[test]
-    fn delay_ack_info_encode() {
-        let payload = DelayAckInfoPayload {
-            max_delayed_acks: 8,
-            delayed_ack_timeout_ms: 150,
-        };
-        let encoded = encode_vec(&payload).expect("encode");
-        assert_eq!(
-            encoded.as_slice(),
-            &[
-                0x80, // max_delayed_acks=8 << 4 = 0x80
-                0x96, 0x00, // delayed_ack_timeout_ms = 150 LE
-            ]
-        );
-        assert_eq!(payload.size(), 3);
-    }
-
-    #[test]
-    fn delay_ack_info_decode() {
-        let bytes = [0x80, 0x96, 0x00];
-        let decoded: DelayAckInfoPayload = decode(&bytes).expect("decode");
-        assert_eq!(decoded.max_delayed_acks, 8);
-        assert_eq!(decoded.delayed_ack_timeout_ms, 150);
-    }
-
-    #[test]
-    fn delay_ack_info_roundtrip() {
-        let original = DelayAckInfoPayload {
-            max_delayed_acks: 15,
-            delayed_ack_timeout_ms: 1000,
-        };
-        let encoded = encode_vec(&original).expect("encode");
-        let decoded: DelayAckInfoPayload = decode(&encoded).expect("decode");
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn delay_ack_info_default_values() {
-        let payload = DelayAckInfoPayload {
-            max_delayed_acks: DelayAckInfoPayload::DEFAULT_MAX_DELAYED_ACKS,
-            delayed_ack_timeout_ms: 50,
-        };
-        assert_eq!(payload.max_delayed_acks, 8);
-    }
-
-    #[test]
-    fn delay_ack_info_insufficient_bytes() {
-        let bytes = [0x80, 0x96]; // only 2 bytes, need 3
-        let result: DecodeResult<DelayAckInfoPayload> = decode(&bytes);
-        assert!(result.is_err());
-    }
-
-    // ── AckOfAcks tests ──
-
-    #[test]
-    fn ack_of_acks_roundtrip() {
-        let original = AckOfAcksPayload {
-            ack_of_acks_seq_num: 0x1234,
-        };
-        let encoded = encode_vec(&original).expect("encode");
-        assert_eq!(encoded.as_slice(), &[0x34, 0x12]); // little-endian
-        assert_eq!(original.size(), 2);
-
-        let decoded: AckOfAcksPayload = decode(&encoded).expect("decode");
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn ack_of_acks_zero() {
-        let original = AckOfAcksPayload { ack_of_acks_seq_num: 0 };
-        let encoded = encode_vec(&original).expect("encode");
-        let decoded: AckOfAcksPayload = decode(&encoded).expect("decode");
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn ack_of_acks_max() {
-        let original = AckOfAcksPayload {
-            ack_of_acks_seq_num: 0xFFFF,
-        };
-        let encoded = encode_vec(&original).expect("encode");
-        let decoded: AckOfAcksPayload = decode(&encoded).expect("decode");
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn ack_of_acks_insufficient_bytes() {
-        let bytes = [0x34]; // only 1 byte, need 2
-        let result: DecodeResult<AckOfAcksPayload> = decode(&bytes);
-        assert!(result.is_err());
     }
 }
