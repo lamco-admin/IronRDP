@@ -463,14 +463,25 @@ impl RdpeudpConnection {
             return false;
         };
 
+        // Read the fixed header on its own first. This runs for every
+        // datagram the connection receives once established, and a full v1
+        // parse of arbitrary bytes can allocate an ACK vector of up to 65535
+        // elements before deciding they were never a SYN+ACK.
+        let Ok(header) = decode::<FecHeader>(wire) else {
+            return false;
+        };
+
+        if !header.flags.contains(V1Flags::SYN | V1Flags::ACK) {
+            return false;
+        }
+
         let Ok(datagram) = decode::<V1Datagram>(wire) else {
             return false;
         };
 
-        datagram.header.flags.contains(V1Flags::SYN | V1Flags::ACK)
-            && datagram
-                .syn_data
-                .is_some_and(|syn_data| syn_data.initial_sequence_number == params.remote_isn)
+        datagram
+            .syn_data
+            .is_some_and(|syn_data| syn_data.initial_sequence_number == params.remote_isn)
     }
 
     /// Retrieve the next outgoing packet to send on the wire.
@@ -640,7 +651,9 @@ impl RdpeudpConnection {
             }),
         };
 
-        self.enqueue_handshake(&datagram);
+        if !self.enqueue_handshake(&datagram) {
+            return;
+        }
 
         self.timers.set(Timer::Retransmit, now + self.rtt.rto());
         self.timers.set(Timer::Idle, now + self.config.idle_timeout);
@@ -671,7 +684,9 @@ impl RdpeudpConnection {
             }),
         };
 
-        self.enqueue_handshake(&datagram);
+        if !self.enqueue_handshake(&datagram) {
+            return;
+        }
 
         self.timers.set(Timer::Retransmit, now + self.rtt.rto());
     }
@@ -682,10 +697,16 @@ impl RdpeudpConnection {
     /// practice. If it somehow does there is no handshake to be had, and
     /// silently dropping the packet would leave the caller waiting on a
     /// connection that will never answer.
-    fn enqueue_handshake(&mut self, datagram: &V1Datagram) {
+    ///
+    /// Returns whether the datagram was queued. Callers must not arm timers
+    /// when it was not: `close` has just cleared them, and re-arming leaves
+    /// a deadline that `handle_timeout` returns early from without ever
+    /// clearing.
+    #[must_use]
+    fn enqueue_handshake(&mut self, datagram: &V1Datagram) -> bool {
         let Ok(bytes) = encode_vec(datagram) else {
             self.close();
-            return;
+            return false;
         };
 
         self.pending_transmits.push_back(Transmit {
@@ -693,6 +714,8 @@ impl RdpeudpConnection {
         });
         self.handshake_datagram = Some(bytes);
         self.handshake_retransmits = 0;
+
+        true
     }
 
     /// Put the last handshake datagram back on the wire because the peer
@@ -810,7 +833,7 @@ impl RdpeudpConnection {
             syn_data_ex: None,
         };
 
-        self.enqueue_handshake(&datagram);
+        let _queued = self.enqueue_handshake(&datagram);
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -1302,12 +1325,11 @@ impl RdpeudpConnection {
         }
 
         // Piggyback an acknowledgment if one is pending
+        let mut acknowledged = false;
         let (ack, ack_vector) = if self.ack_pending {
-            self.ack_pending = false;
-            self.timers.clear(Timer::AckDelay);
-
-            match self.take_acknowledgement(now) {
+            match self.build_acknowledgement(now) {
                 Some(acknowledgement) => {
+                    acknowledged = true;
                     flags |= acknowledgement.flag;
                     (acknowledgement.ack, acknowledgement.ack_vector)
                 }
@@ -1318,7 +1340,7 @@ impl RdpeudpConnection {
         };
 
         // AckOfAcks if pending
-        let ack_of_acks = self.pending_ack_of_acks.take().map(|seq| AckOfAcksPayload {
+        let ack_of_acks = self.pending_ack_of_acks.map(|seq| AckOfAcksPayload {
             ack_of_acks_seq_num: seq,
         });
         if ack_of_acks.is_some() {
@@ -1341,14 +1363,26 @@ impl RdpeudpConnection {
             }),
         };
 
-        self.encode_v2_packet(&packet)
+        let transmit = self.encode_v2_packet(&packet)?;
+
+        // Retire what the packet carried only now that it exists. Clearing
+        // any of this before the encode drops an acknowledgment that was
+        // never sent, and the peer has no way to learn it was owed one.
+        if acknowledged {
+            self.ack_pending = false;
+            self.timers.clear(Timer::AckDelay);
+            self.commit_acknowledgement();
+        }
+        self.pending_ack_of_acks = None;
+
+        Some(transmit)
     }
 
     /// Build a standalone ACK (no data).
     fn build_standalone_ack(&mut self, now: MonotonicInstant) -> Option<Transmit> {
         let log_window_size = self.params.as_ref()?.log_window_size;
 
-        let acknowledgement = self.take_acknowledgement(now)?;
+        let acknowledgement = self.build_acknowledgement(now)?;
         let mut flags = acknowledgement.flag;
         let (ack, ack_vector) = (acknowledgement.ack, acknowledgement.ack_vector);
 
@@ -1356,7 +1390,7 @@ impl RdpeudpConnection {
             flags |= V2Flags::CN;
         }
 
-        let ack_of_acks = self.pending_ack_of_acks.take().map(|seq| AckOfAcksPayload {
+        let ack_of_acks = self.pending_ack_of_acks.map(|seq| AckOfAcksPayload {
             ack_of_acks_seq_num: seq,
         });
         if ack_of_acks.is_some() {
@@ -1374,19 +1408,25 @@ impl RdpeudpConnection {
             data_body: None,
         };
 
-        self.encode_v2_packet(&packet)
+        let transmit = self.encode_v2_packet(&packet)?;
+
+        // Same ordering as the data path: the window only moves past packets
+        // whose acknowledgment actually made it into a packet.
+        self.commit_acknowledgement();
+        self.pending_ack_of_acks = None;
+
+        Some(transmit)
     }
 
     /// Build the cumulative ACK payload from the recv window state.
-    /// Build the acknowledgment to attach to an outgoing packet, and
-    /// release the receive-window slots it covers.
+    /// Build the acknowledgment to attach to an outgoing packet.
     ///
     /// A cumulative ACK claims every packet through its sequence number, so
     /// it is only true when the window has no holes. [MS-RDPEUDP2] 3.1.1.2.2
     /// keeps the vector form for the other case. Sending the cumulative form
     /// over a hole tells the sender to stop retransmitting a packet that
     /// never arrived, and the receiver never asks for it again.
-    fn take_acknowledgement(&mut self, now: MonotonicInstant) -> Option<Acknowledgement> {
+    fn build_acknowledgement(&self, now: MonotonicInstant) -> Option<Acknowledgement> {
         let recv_window = self.recv_window.as_ref()?;
 
         let acknowledgement = if recv_window.has_gaps() {
@@ -1403,12 +1443,18 @@ impl RdpeudpConnection {
             }
         };
 
-        self.recv_window
-            .as_mut()
-            .expect("checked at the top of this function")
-            .release_acknowledged();
-
         Some(acknowledgement)
+    }
+
+    /// Retire the receive-window slots covered by an acknowledgment that is
+    /// now encoded and on its way out.
+    ///
+    /// Separate from building it so a failed encode cannot advance the
+    /// window past packets whose acknowledgment never reached the wire.
+    fn commit_acknowledgement(&mut self) {
+        if let Some(recv_window) = self.recv_window.as_mut() {
+            recv_window.release_acknowledged();
+        }
     }
 
     fn build_ack_payload(&self, recv_window: &RecvWindow, _now: MonotonicInstant) -> AckPayload {
