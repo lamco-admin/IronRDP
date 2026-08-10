@@ -162,6 +162,16 @@ enum State {
     Closed,
 }
 
+/// An acknowledgment ready to go onto an outgoing packet.
+///
+/// The cumulative and vector forms are mutually exclusive: [MS-RDPEUDP2]
+/// 2.2.1.1 says the ACKVEC flag "MUST NOT be set if the ACK flag is set".
+struct Acknowledgement {
+    flag: V2Flags,
+    ack: Option<AckPayload>,
+    ack_vector: Option<AckVectorPayload>,
+}
+
 /// Negotiated parameters from the handshake.
 #[derive(Debug, Clone)]
 struct NegotiatedParams {
@@ -902,11 +912,6 @@ impl RdpeudpConnection {
             None => return,
         };
 
-        let params = match self.params.as_ref() {
-            Some(p) => p,
-            None => return,
-        };
-
         // Update remote timestamp reference from the received timestamp
         self.remote_timestamp_ref = seq::reconstruct_timestamp(ack.received_ts, self.remote_timestamp_ref);
 
@@ -914,19 +919,9 @@ impl RdpeudpConnection {
         let reference = send_window.next_data_seq().saturating_sub(1);
         let acked_seq = seq::reconstruct_seq(ack.seq_num, reference);
 
-        // Mark all packets up to acked_seq as received (cumulative ACK)
-        let mut newly_acked_bytes: u64 = 0;
-        let base_seq = u64::from(params.local_isn) + 1;
-
-        // The ACK seq_num is the highest sequentially received DataSeqNum.
-        // Mark all packets from base up through acked_seq as received.
-        let mut seq = base_seq;
-        while seq <= acked_seq {
-            if let Some(size) = send_window.mark_received(seq) {
-                newly_acked_bytes += u64::try_from(size).expect("packet size fits in u64");
-            }
-            seq += 1;
-        }
+        // The ACK seq_num is the highest sequentially received DataSeqNum, so
+        // everything at or below it is acknowledged.
+        let newly_acked_bytes = send_window.mark_received_through(acked_seq);
 
         // RTT estimation from ACK timing (Karn's algorithm)
         // Only use samples from non-retransmitted packets
@@ -1109,34 +1104,69 @@ impl RdpeudpConnection {
 
         let lost_seqs = self.loss_detector.detect(send_window, highest_acked, rto, now);
 
-        for &data_seq in &lost_seqs {
-            if let Some(info) = send_window.mark_lost(data_seq) {
-                // Congestion control: react to loss
-                self.congestion.on_loss(data_seq);
-
-                // Enqueue for retransmission
-                self.reliability.enqueue(info.channel_seq, info.data);
-
-                // Set CWR on next data packet (retransmissions always carry CWR)
-                self.cwr_pending = true;
-            }
+        for data_seq in lost_seqs {
+            self.declare_lost(data_seq);
         }
+    }
+
+    /// Move one packet out of the send window and onto the retransmit queue.
+    fn declare_lost(&mut self, data_seq: u64) {
+        let Some(send_window) = self.send_window.as_mut() else {
+            return;
+        };
+
+        let Some(info) = send_window.mark_lost(data_seq) else {
+            return;
+        };
+
+        self.congestion.on_loss(data_seq);
+        self.reliability.enqueue(info.channel_seq, info.data);
+
+        // Retransmissions always carry CWR.
+        self.cwr_pending = true;
+    }
+
+    /// Declare the oldest unacknowledged packet lost because the retransmit
+    /// timer expired on it.
+    ///
+    /// The timer firing is itself the loss signal: [MS-RDPEUDP] 3.1.6.1 arms
+    /// it for a datagram that has gone unacknowledged for an RTO, and 3.1.1.5
+    /// leaves the choice of retransmit scheme to the implementation. Without
+    /// this, a packet lost with fewer than `DEFAULT_REORDER_THRESHOLD` later
+    /// packets behind it is never retransmitted at all, because the time
+    /// threshold in `LossDetector` is computed from an RTO that
+    /// `RttEstimator::on_timeout` has already doubled and so always sits
+    /// ahead of the elapsed time.
+    fn declare_oldest_pending_lost(&mut self) {
+        let Some(send_window) = self.send_window.as_ref() else {
+            return;
+        };
+
+        let Some(oldest) = send_window.pending_entries().map(|entry| entry.data_seq).min() else {
+            return;
+        };
+
+        self.declare_lost(oldest);
     }
 
     /// Update the retransmit timer based on send window state.
     fn update_retransmit_timer(&mut self, now: MonotonicInstant) {
-        let send_window = match self.send_window.as_ref() {
-            Some(sw) => sw,
+        let has_pending = match self.send_window.as_ref() {
+            Some(send_window) => send_window.pending_entries().next().is_some(),
             None => return,
         };
 
-        if send_window.pending_entries().next().is_some() {
-            // There are still pending packets: keep the timer running
+        // The retransmit queue counts too. A packet declared lost leaves the
+        // send window immediately but may sit in the queue while the
+        // congestion window is full, and with no timer armed nothing would
+        // come back to it if the peer had also gone quiet.
+        if has_pending || self.reliability.has_pending() {
+            // Keep the timer running
             if !self.timers.is_set(Timer::Retransmit) {
                 self.timers.set(Timer::Retransmit, now + self.rtt.rto());
             }
         } else {
-            // No pending packets: clear the timer
+            // Nothing outstanding: clear the timer
             self.timers.clear(Timer::Retransmit);
         }
     }
@@ -1238,8 +1268,7 @@ impl RdpeudpConnection {
         set_cwr: bool,
         now: MonotonicInstant,
     ) -> Option<Transmit> {
-        let params = self.params.as_ref()?;
-        let recv_window = self.recv_window.as_ref()?;
+        let log_window_size = self.params.as_ref()?.log_window_size;
 
         let mut flags = V2Flags::DATA;
 
@@ -1250,18 +1279,21 @@ impl RdpeudpConnection {
             flags |= V2Flags::CN;
         }
 
-        // Piggyback ACK if pending
-        let ack = if self.ack_pending {
+        // Piggyback an acknowledgment if one is pending
+        let (ack, ack_vector) = if self.ack_pending {
             self.ack_pending = false;
             self.timers.clear(Timer::AckDelay);
-            Some(self.build_ack_payload(recv_window, now))
-        } else {
-            None
-        };
 
-        if ack.is_some() {
-            flags |= V2Flags::ACK;
-        }
+            match self.take_acknowledgement(now) {
+                Some(acknowledgement) => {
+                    flags |= acknowledgement.flag;
+                    (acknowledgement.ack, acknowledgement.ack_vector)
+                }
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
 
         // AckOfAcks if pending
         let ack_of_acks = self.pending_ack_of_acks.take().map(|seq| AckOfAcksPayload {
@@ -1272,10 +1304,7 @@ impl RdpeudpConnection {
         }
 
         let packet = V2Packet {
-            header: V2Header {
-                flags,
-                log_window_size: params.log_window_size,
-            },
+            header: V2Header { flags, log_window_size },
             ack,
             overhead_size: None,
             delay_ack_info: None,
@@ -1283,7 +1312,7 @@ impl RdpeudpConnection {
             data_header: Some(DataHeader {
                 data_seq_num: seq::truncate_seq(data_seq),
             }),
-            ack_vector: None,
+            ack_vector,
             data_body: Some(DataBody {
                 channel_seq_num: seq::truncate_seq(channel_seq),
                 data,
@@ -1295,22 +1324,11 @@ impl RdpeudpConnection {
 
     /// Build a standalone ACK (no data).
     fn build_standalone_ack(&mut self, now: MonotonicInstant) -> Option<Transmit> {
-        let params = self.params.as_ref()?;
-        let recv_window = self.recv_window.as_ref()?;
+        let log_window_size = self.params.as_ref()?.log_window_size;
 
-        let mut flags = V2Flags::empty();
-
-        let has_gaps = recv_window.has_gaps();
-
-        // Choose between ACK and ACKVEC:
-        // Use ACKVEC when there are gaps, ACK when contiguous
-        let (ack, ack_vector) = if has_gaps {
-            flags |= V2Flags::ACKVEC;
-            (None, Some(self.build_ack_vector_payload(recv_window, now)))
-        } else {
-            flags |= V2Flags::ACK;
-            (Some(self.build_ack_payload(recv_window, now)), None)
-        };
+        let acknowledgement = self.take_acknowledgement(now)?;
+        let mut flags = acknowledgement.flag;
+        let (ack, ack_vector) = (acknowledgement.ack, acknowledgement.ack_vector);
 
         if self.cn_pending {
             flags |= V2Flags::CN;
@@ -1324,10 +1342,7 @@ impl RdpeudpConnection {
         }
 
         let packet = V2Packet {
-            header: V2Header {
-                flags,
-                log_window_size: params.log_window_size,
-            },
+            header: V2Header { flags, log_window_size },
             ack,
             overhead_size: None,
             delay_ack_info: None,
@@ -1341,6 +1356,39 @@ impl RdpeudpConnection {
     }
 
     /// Build the cumulative ACK payload from the recv window state.
+    /// Build the acknowledgment to attach to an outgoing packet, and
+    /// release the receive-window slots it covers.
+    ///
+    /// A cumulative ACK claims every packet through its sequence number, so
+    /// it is only true when the window has no holes. [MS-RDPEUDP2] 3.1.1.2.2
+    /// keeps the vector form for the other case. Sending the cumulative form
+    /// over a hole tells the sender to stop retransmitting a packet that
+    /// never arrived, and the receiver never asks for it again.
+    fn take_acknowledgement(&mut self, now: MonotonicInstant) -> Option<Acknowledgement> {
+        let recv_window = self.recv_window.as_ref()?;
+
+        let acknowledgement = if recv_window.has_gaps() {
+            Acknowledgement {
+                flag: V2Flags::ACKVEC,
+                ack: None,
+                ack_vector: Some(self.build_ack_vector_payload(recv_window, now)),
+            }
+        } else {
+            Acknowledgement {
+                flag: V2Flags::ACK,
+                ack: Some(self.build_ack_payload(recv_window, now)),
+                ack_vector: None,
+            }
+        };
+
+        self.recv_window
+            .as_mut()
+            .expect("checked at the top of this function")
+            .release_acknowledged();
+
+        Some(acknowledgement)
+    }
+
     fn build_ack_payload(&self, recv_window: &RecvWindow, _now: MonotonicInstant) -> AckPayload {
         // seq_num = highest sequentially received DataSeqNum
         // For cumulative ACK, this is base_seq + count of contiguous received - 1,
@@ -1406,18 +1454,20 @@ impl RdpeudpConnection {
     fn handle_retransmit_timeout(&mut self, now: MonotonicInstant) {
         self.timers.clear(Timer::Retransmit);
 
-        // Apply exponential backoff
-        self.rtt.on_timeout();
-
         if self.state != State::Established {
+            self.rtt.on_timeout();
             self.retransmit_handshake(now);
             return;
         }
 
-        // Run loss detection: time-based loss will fire now
-        self.run_loss_detection(now);
+        // Before the backoff, which moves the threshold this would be
+        // measured against out of reach. See `declare_oldest_pending_lost`.
+        self.declare_oldest_pending_lost();
 
-        // Reset the timer if there are still pending packets
+        // Apply exponential backoff
+        self.rtt.on_timeout();
+
+        // Reset the timer if there is still unfinished business
         self.update_retransmit_timer(now);
     }
 

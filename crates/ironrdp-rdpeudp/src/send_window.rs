@@ -232,6 +232,36 @@ impl SendWindow {
         Some(size)
     }
 
+    /// Mark every pending packet up to and including `data_seq` as
+    /// received, returning the total bytes that changed state.
+    ///
+    /// Walking the window rather than the sequence range keeps the cost
+    /// tied to how many packets are in flight. Counting from the initial
+    /// sequence number instead costs one iteration per sequence number
+    /// ever sent, on every acknowledgment, and a peer naming a sequence
+    /// number far ahead of the window pays for the whole gap.
+    pub(crate) fn mark_received_through(&mut self, data_seq: u64) -> u64 {
+        let mut bytes = 0;
+
+        // Entries are ordered by DataSeqNum and `mark_received` drains the
+        // resolved ones off the front, so this walks each acknowledged
+        // packet once.
+        while let Some(front) = self.entries.front() {
+            if front.data_seq > data_seq {
+                break;
+            }
+
+            let front_seq = front.data_seq;
+            let Some(size) = self.mark_received(front_seq) else {
+                break;
+            };
+
+            bytes += u64::try_from(size).expect("packet size fits in u64");
+        }
+
+        bytes
+    }
+
     /// Mark a packet as lost by its DataSeqNum.
     ///
     /// Removes the entry from the window and returns its info

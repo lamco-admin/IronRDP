@@ -140,6 +140,39 @@ impl RecvWindow {
         delivered
     }
 
+    /// Advance the lower bound past the received packets at the bottom of
+    /// the window, which is what sending an acknowledgment that names them
+    /// permits.
+    ///
+    /// [MS-RDPEUDP2] 3.1.1.2.2 gives two events that move the lower bound:
+    /// this one and an AckOfAcks from the sender (`advance_base`). Only
+    /// implementing the second stalls a connection that is not losing
+    /// anything, because a sender with nothing to report sends no ACK
+    /// vector, so no AckOfAcks comes back, so the bound never moves and
+    /// `receive` starts rejecting everything one window past the last
+    /// AckOfAcks.
+    ///
+    /// The spec's caveat for the vector case ("the lower bound can advance
+    /// only if the first sequence number ... is in the Received state")
+    /// falls out of taking the leading run: a hole at the bottom is a run
+    /// of length zero.
+    ///
+    /// Returns the number of slots released.
+    pub(crate) fn release_acknowledged(&mut self) -> usize {
+        let received = self
+            .entries
+            .iter()
+            .take_while(|entry| entry.state == RecvEntryState::Received)
+            .count();
+
+        if received > 0 {
+            self.entries.drain(..received);
+            self.base_seq += u64::try_from(received).expect("run length fits in u64");
+        }
+
+        received
+    }
+
     /// Advance the window base up to `new_base`.
     ///
     /// Called when an AckOfAcks is received, telling us the sender

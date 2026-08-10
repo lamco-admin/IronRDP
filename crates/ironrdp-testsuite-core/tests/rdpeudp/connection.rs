@@ -622,3 +622,152 @@ fn data_is_not_mistaken_for_a_repeated_syn_ack() {
 
     assert_eq!(client.poll_event(), Some(Event::DataReceived(vec![0x11; 32])));
 }
+
+// ── Receive window lifecycle ──
+
+/// Shuttle packets between the two endpoints until neither has more to say.
+fn pump(client: &mut RdpeudpConnection, server: &mut RdpeudpConnection, at: MonotonicInstant) {
+    for _ in 0..10_000 {
+        let mut moved = false;
+
+        while let Some(transmit) = client.poll_transmit(at) {
+            let mut bytes = transmit.contents;
+            server.handle_datagram(&mut bytes, at).expect("server handles");
+            moved = true;
+        }
+
+        while let Some(transmit) = server.poll_transmit(at) {
+            let mut bytes = transmit.contents;
+            client.handle_datagram(&mut bytes, at).expect("client handles");
+            moved = true;
+        }
+
+        if !moved {
+            return;
+        }
+    }
+
+    panic!("the endpoints never went quiet");
+}
+
+fn drain_received(conn: &mut RdpeudpConnection) -> Vec<Vec<u8>> {
+    let mut received = Vec::new();
+    while let Some(event) = conn.poll_event() {
+        if let Event::DataReceived(chunk) = event {
+            received.push(chunk);
+        }
+    }
+    received
+}
+
+/// [MS-RDPEUDP2] 3.1.1.2.2 moves the receive window's lower bound when an
+/// acknowledgment naming those packets is sent, as well as when an AckOfAcks
+/// arrives. Nothing is lost in this exchange, so the receiver never sends an
+/// ACK vector and the sender never sends an AckOfAcks: the bound has to move
+/// on the first of those two events or the window fills and stays full.
+#[test]
+fn a_clean_transfer_outlasts_the_receive_window() {
+    let (mut client, mut server, t) = establish_pair();
+
+    // Four times the 64-slot window implied by log_window_size 6.
+    let chunk_count = 256usize;
+    for i in 0..chunk_count {
+        let byte = u8::try_from(i % 256).expect("modulo 256 fits in u8");
+        client.send(vec![byte; 4]).expect("send");
+    }
+
+    pump(&mut client, &mut server, later(t, 200));
+
+    let received = drain_received(&mut server);
+    assert_eq!(received.len(), chunk_count, "the receive window stalled");
+
+    for (i, chunk) in received.iter().enumerate() {
+        let byte = u8::try_from(i % 256).expect("modulo 256 fits in u8");
+        assert_eq!(chunk, &vec![byte; 4], "chunk {i} arrived out of order");
+    }
+}
+
+/// Run both endpoints forward through their own timers up to `until`,
+/// delivering everything they emit along the way.
+fn advance(client: &mut RdpeudpConnection, server: &mut RdpeudpConnection, until: MonotonicInstant) {
+    for _ in 0..1_000 {
+        let next = [client.poll_timeout(), server.poll_timeout()]
+            .into_iter()
+            .flatten()
+            .min();
+
+        let Some(at) = next.filter(|at| *at <= until) else {
+            return;
+        };
+
+        client.handle_timeout(at);
+        server.handle_timeout(at);
+        pump(client, server, at);
+    }
+
+    panic!("the endpoints never stopped scheduling work");
+}
+
+/// A packet lost on its own, with too few behind it to trip the reordering
+/// threshold, has only the retransmit timer to recover it. That timer used to
+/// hand the decision to a time threshold derived from an RTO it had just
+/// doubled, so the threshold always sat ahead of the elapsed time and the
+/// packet was never retransmitted at all.
+#[test]
+fn a_lone_lost_packet_is_recovered() {
+    let (mut client, mut server, t) = establish_pair();
+
+    client.send(vec![0xA1; 8]).expect("send");
+    client.send(vec![0xA2; 8]).expect("send");
+
+    // The first packet never reaches the server.
+    let _dropped = client.poll_transmit(later(t, 100)).expect("first data packet");
+    let delivered = client.poll_transmit(later(t, 100)).expect("second data packet");
+
+    let mut bytes = delivered.contents;
+    server.handle_datagram(&mut bytes, later(t, 150)).expect("handle data");
+
+    // Nothing has been delivered to the application: the second chunk is
+    // waiting behind the hole.
+    assert!(drain_received(&mut server).is_empty());
+
+    advance(&mut client, &mut server, later(t, 10_000));
+
+    assert_eq!(
+        drain_received(&mut server),
+        vec![vec![0xA1; 8], vec![0xA2; 8]],
+        "the lost packet was never retransmitted"
+    );
+}
+
+/// A cumulative ACK claims every packet through its sequence number, so it
+/// cannot describe a window with a hole in it. The piggybacked path sent one
+/// regardless, which tells the sender its lost packet arrived.
+#[test]
+fn a_hole_is_never_reported_as_a_cumulative_ack() {
+    let (mut client, mut server, t) = establish_pair();
+
+    client.send(vec![0xA1; 8]).expect("send");
+    client.send(vec![0xA2; 8]).expect("send");
+
+    let _dropped = client.poll_transmit(later(t, 100)).expect("first data packet");
+    let delivered = client.poll_transmit(later(t, 100)).expect("second data packet");
+
+    let mut bytes = delivered.contents;
+    server.handle_datagram(&mut bytes, later(t, 150)).expect("handle data");
+
+    // Give the server data of its own, so its acknowledgment rides along on a
+    // data packet rather than going out standalone.
+    server.send(vec![0xB1; 8]).expect("send");
+    let reply = server.poll_transmit(later(t, 200)).expect("server data packet");
+
+    let mut reply_bytes = reply.contents;
+    let (_, packet_bytes) = decode_with_prefix(&mut reply_bytes).expect("prefix");
+    let packet: V2Packet = decode(packet_bytes).expect("decode");
+
+    assert!(packet.data_body.is_some(), "the acknowledgment should be piggybacked");
+    assert!(packet.ack.is_none(), "a cumulative ACK cannot describe a hole");
+    assert!(packet.ack_vector.is_some(), "the hole needs a vector to describe it");
+    assert!(packet.header.flags.contains(V2Flags::ACKVEC));
+    assert!(!packet.header.flags.contains(V2Flags::ACK));
+}
