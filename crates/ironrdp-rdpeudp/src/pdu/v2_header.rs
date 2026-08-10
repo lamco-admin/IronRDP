@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let original = V2Header {
-            flags: V2Flags::ACKVEC | V2Flags::AOA | V2Flags::CN,
+            flags: V2Flags::ACKVEC | V2Flags::AOA | V2Flags::OVERHEADSIZE,
             log_window_size: 10,
         };
         let encoded = encode_vec(&original).expect("encode");
@@ -184,24 +184,23 @@ mod tests {
 
     #[test]
     fn flags_only_lower_12_bits() {
-        // The six flags [MS-RDPEUDP2] 2.2.1.1 defines, plus the CN and CWR
-        // this crate carries over from the v1 header: 0x001, 0x004, 0x008,
-        // 0x010, 0x020, 0x040, 0x080, 0x100 = 0x1FD.
+        // The six flags [MS-RDPEUDP2] 2.2.1.1 defines and no others:
+        // 0x001, 0x004, 0x008, 0x010, 0x040, 0x100 = 0x15D.
         // from_bits_truncate drops undefined bit positions.
         let all_defined = V2Flags::all();
-        assert_eq!(all_defined.bits(), 0x1FD);
+        assert_eq!(all_defined.bits(), 0x15D);
 
         let header = V2Header {
             flags: all_defined,
             log_window_size: 0xF,
         };
         let wire = header.to_wire();
-        assert_eq!(wire, 0xF1FD); // 0x1FD | (0xF << 12)
+        assert_eq!(wire, 0xF15D); // 0x15D | (0xF << 12)
 
         // Can't decode all_defined because ACK and ACKVEC are both set.
         // Test with valid flags to verify the bit separation.
         let header = V2Header {
-            flags: V2Flags::DATA | V2Flags::CWR | V2Flags::DELAYACKINFO,
+            flags: V2Flags::DATA | V2Flags::ACKVEC | V2Flags::DELAYACKINFO,
             log_window_size: 12,
         };
         let encoded = encode_vec(&header).expect("encode");

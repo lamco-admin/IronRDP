@@ -28,23 +28,28 @@ bitflags! {
         /// AckOfAcks payload (Section 2.2.1.2.4) is present.
         const AOA = 0x010;
 
-        /// Congestion Notification: receiver detected packet loss.
-        const CN = 0x020;
-
         /// OverheadSize payload (Section 2.2.1.2.2) is present.
         const OVERHEADSIZE = 0x040;
-
-        /// Congestion Window Reset: sender reacted to CN.
-        const CWR = 0x080;
 
         /// DelayAckInfo payload (Section 2.2.1.2.3) is present.
         const DELAYACKINFO = 0x100;
     }
 }
 
-// There is no DUMMY flag here on purpose. A dummy packet is marked by
-// Packet_Type_Index 8 in the PacketPrefixByte, not in this header; see
-// [MS-RDPEUDP2] 3.1.1.1.5 and `crate::pdu::prefix`.
+// This is the whole table. [MS-RDPEUDP2] 2.2.1.1 defines six flags and no
+// others, so a bit outside this set is one no peer will read and none of them
+// carries a meaning beyond "this payload is present".
+//
+// Two absences are deliberate, because both were once defined here:
+//
+// - There is no DUMMY flag. A dummy packet is marked by Packet_Type_Index 8
+//   in the PacketPrefixByte, one layer down (3.1.1.1.5, `crate::pdu::prefix`).
+// - There are no CN or CWR flags. Those belong to MS-RDPEUDP, whose
+//   RDPUDP_FEC_HEADER carries RDPUDP_FLAG_CN 0x0020 and RDPUDP_FLAG_CWR
+//   0x0040 (see `crate::pdu::v1_flags`). MS-RDPEUDP2 has no explicit
+//   congestion signalling at all: it names a Congestion Controller in
+//   3.1.1.2.2 as a higher-layer concept and leaves it to infer conditions
+//   from what it observes.
 
 impl V2Flags {
     /// Mask for the 12-bit flags field within the 16-bit header word.
@@ -67,9 +72,7 @@ mod tests {
         assert_eq!(V2Flags::DATA.bits(), 0x004);
         assert_eq!(V2Flags::ACKVEC.bits(), 0x008);
         assert_eq!(V2Flags::AOA.bits(), 0x010);
-        assert_eq!(V2Flags::CN.bits(), 0x020);
         assert_eq!(V2Flags::OVERHEADSIZE.bits(), 0x040);
-        assert_eq!(V2Flags::CWR.bits(), 0x080);
         assert_eq!(V2Flags::DELAYACKINFO.bits(), 0x100);
     }
 
@@ -101,7 +104,7 @@ mod tests {
 
     #[test]
     fn roundtrip_from_bits() {
-        let original = V2Flags::DATA | V2Flags::CWR | V2Flags::DELAYACKINFO;
+        let original = V2Flags::DATA | V2Flags::ACKVEC | V2Flags::DELAYACKINFO;
         let bits = original.bits();
         let restored = V2Flags::from_bits_truncate(bits);
         assert_eq!(original, restored);

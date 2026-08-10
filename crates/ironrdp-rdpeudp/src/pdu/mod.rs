@@ -289,16 +289,13 @@ impl Decode<'_> for V1Datagram {
 // Composite V2 Packet
 // ════════════════════════════════════════════════════════════════════
 
-/// V2 flags that don't gate any optional payload; preserved on encode.
-const V2_STANDALONE_FLAGS: u16 = V2Flags::CN.bits() | V2Flags::CWR.bits();
-
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 /// A complete RDP-UDP2 packet (after prefix byte extraction).
 ///
 /// MS-RDPEUDP2 Section 2.2.1.
 /// The V2Header's flags field determines which optional payloads
 /// are present. On encode, payload-gating flags are auto-derived;
-/// standalone flags (CN, CWR) are preserved from the header.
+/// there are no standalone flags to preserve.
 ///
 /// Wire payload ordering (per MS-RDPEUDP2 Section 2.2.1):
 /// 1. V2Header (mandatory, 2 bytes)
@@ -315,7 +312,7 @@ const V2_STANDALONE_FLAGS: u16 = V2Flags::CN.bits() | V2Flags::CWR.bits();
 /// - `data_header` and `data_body` must be both present or both absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2Packet {
-    /// Mandatory header. Standalone flags (CN, CWR) are
+    /// Mandatory header. Payload-gating flags are
     /// preserved; payload-gating flags are recomputed on encode.
     pub header: V2Header,
 
@@ -349,9 +346,13 @@ pub struct V2Packet {
 impl V2Packet {
     const NAME: &'static str = "RDP-UDP2 Packet";
 
-    /// Compute flags from populated fields, preserving standalone flags.
+    /// Compute flags from populated fields.
+    ///
+    /// Every flag [MS-RDPEUDP2] 2.2.1.1 defines announces a payload, so there
+    /// is nothing to carry over from the caller's header: what is present
+    /// determines the field completely.
     fn compute_flags(&self) -> V2Flags {
-        let mut flags = V2Flags::from_bits_truncate(self.header.flags.bits() & V2_STANDALONE_FLAGS);
+        let mut flags = V2Flags::empty();
 
         if self.ack.is_some() {
             flags |= V2Flags::ACK;

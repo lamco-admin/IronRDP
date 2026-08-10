@@ -277,12 +277,6 @@ pub struct RdpeudpConnection {
     /// Whether we need to send a standalone ACK (no data piggybacked).
     ack_pending: bool,
 
-    /// Whether we need to set the CWR flag on the next data packet.
-    cwr_pending: bool,
-
-    /// Whether the remote has gaps (we should set CN on our ACKs).
-    cn_pending: bool,
-
     /// The DataSeqNum we are waiting to see acknowledged, when the peer still
     /// needs telling.
     ///
@@ -450,8 +444,6 @@ impl RdpeudpConnection {
             pending_events: VecDeque::new(),
             send_buffer: VecDeque::new(),
             ack_pending: false,
-            cwr_pending: false,
-            cn_pending: false,
             pending_ack_of_acks: None,
             handshake_datagram: None,
             handshake_retransmits: 0,
@@ -990,17 +982,6 @@ impl RdpeudpConnection {
             self.process_ack_of_acks(aoa);
         }
 
-        // Process CN flag (congestion notification from remote)
-        if packet.header.flags.contains(V2Flags::CN) {
-            self.process_cn_flag(&packet.header);
-        }
-
-        // Process CWR flag (congestion window reduced acknowledgment)
-        if packet.header.flags.contains(V2Flags::CWR) {
-            // Remote acknowledged our CN: stop setting CN
-            self.cn_pending = false;
-        }
-
         // Process data payload
         if let (Some(dh), Some(db)) = (&packet.data_header, &packet.data_body) {
             if prefix.is_dummy() {
@@ -1170,23 +1151,6 @@ impl RdpeudpConnection {
         recv_window.advance_base(new_base);
     }
 
-    /// Process the CN flag from a received packet.
-    fn process_cn_flag(&mut self, _header: &V2Header) {
-        // The remote is telling us it has detected loss in our direction.
-        // React by halving the congestion window.
-        let send_window = match self.send_window.as_ref() {
-            Some(sw) => sw,
-            None => return,
-        };
-
-        let ack_seq = send_window.highest_acked_data_seq().unwrap_or(0);
-        if self.congestion.on_congestion_notification(ack_seq) {
-            // We reduced our window: need to send CWR on next data packet
-            self.cwr_pending = true;
-        }
-    }
-
-    /// Process received data.
     /// Account for a dummy packet without handing anything to the
     /// application.
     ///
@@ -1204,12 +1168,6 @@ impl RdpeudpConnection {
 
         if !recv_window.receive_without_payload(data_seq) {
             return;
-        }
-
-        let has_gaps = recv_window.has_gaps();
-
-        if has_gaps {
-            self.cn_pending = true;
         }
 
         self.ack_pending = true;
@@ -1235,11 +1193,6 @@ impl RdpeudpConnection {
         let is_new = recv_window.receive(data_seq, channel_seq, db.data.clone());
 
         if is_new {
-            // Check for gaps: if the receiver has gaps, set CN on our next ACK
-            if recv_window.has_gaps() {
-                self.cn_pending = true;
-            }
-
             // Drain ordered data for application delivery
             let delivered = recv_window.drain_ordered();
             for chunk in delivered {
@@ -1298,9 +1251,6 @@ impl RdpeudpConnection {
         self.congestion.on_loss(data_seq, largest_sent);
         self.reliability.enqueue(info.channel_seq, info.data);
         self.pending_ack_of_acks = Some(lowest_unacknowledged);
-
-        // Retransmissions always carry CWR.
-        self.cwr_pending = true;
     }
 
     /// Stop advertising the AckOfAcks once the peer has moved past it.
@@ -1390,21 +1340,9 @@ impl RdpeudpConnection {
         // Create a new DataSeqNum for the retransmit but preserve ChannelSeqNum
         let new_data_seq = send_window.push_retransmit(entry.channel_seq, entry.data.clone(), now)?;
 
-        // Build the v2 packet with the retransmitted data
-        // Retransmissions always carry CWR
-        let transmit = self.build_data_packet(
-            new_data_seq,
-            entry.channel_seq,
-            entry.data,
-            true, // CWR on retransmit
-            now,
-        );
+        let transmit = self.build_data_packet(new_data_seq, entry.channel_seq, entry.data, now);
 
         if transmit.is_some() {
-            // Record CWR seq
-            self.congestion.set_cwr_seq(new_data_seq);
-            self.cwr_pending = false;
-
             // Reset retransmit timer
             self.timers.set(Timer::Retransmit, now + self.rtt.rto());
         }
@@ -1434,15 +1372,9 @@ impl RdpeudpConnection {
         // Push into send window (assigns DataSeqNum and ChannelSeqNum)
         let (data_seq, channel_seq) = send_window.push(data.clone(), now)?;
 
-        let set_cwr = self.cwr_pending;
-        let transmit = self.build_data_packet(data_seq, channel_seq, data, set_cwr, now);
+        let transmit = self.build_data_packet(data_seq, channel_seq, data, now);
 
         if transmit.is_some() {
-            if set_cwr {
-                self.congestion.set_cwr_seq(data_seq);
-                self.cwr_pending = false;
-            }
-
             // Set retransmit timer if not already running
             if !self.timers.is_set(Timer::Retransmit) {
                 self.timers.set(Timer::Retransmit, now + self.rtt.rto());
@@ -1458,19 +1390,11 @@ impl RdpeudpConnection {
         data_seq: u64,
         channel_seq: u64,
         data: Vec<u8>,
-        set_cwr: bool,
         now: MonotonicInstant,
     ) -> Option<Transmit> {
         let log_window_size = self.params.as_ref()?.log_window_size;
 
         let mut flags = V2Flags::DATA;
-
-        if set_cwr {
-            flags |= V2Flags::CWR;
-        }
-        if self.cn_pending {
-            flags |= V2Flags::CN;
-        }
 
         // Piggyback an acknowledgment if one is pending
         let mut acknowledged = false;
@@ -1532,10 +1456,6 @@ impl RdpeudpConnection {
         let acknowledgement = self.build_acknowledgement(now)?;
         let mut flags = acknowledgement.flag;
         let (ack, ack_vector) = (acknowledgement.ack, acknowledgement.ack_vector);
-
-        if self.cn_pending {
-            flags |= V2Flags::CN;
-        }
 
         let ack_of_acks = self.pending_ack_of_acks.map(|seq| AckOfAcksPayload {
             ack_of_acks_seq_num: seq::truncate_seq(seq),

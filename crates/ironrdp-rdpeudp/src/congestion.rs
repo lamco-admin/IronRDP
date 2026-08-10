@@ -2,16 +2,17 @@
 //!
 //! MS-RDPEUDP Section 3.1.1 and MS-RDPEUDP2 Section 3.1.1.2.
 //!
-//! Implements a standard NewReno-style congestion controller with
-//! slow start and congestion avoidance phases. Integrates with the
-//! CN/CWR flag mechanism defined by MS-RDPEUDP:
+//! Implements a standard NewReno-style congestion controller with slow
+//! start and congestion avoidance phases.
 //!
-//! 1. Receiver detects loss → sets CN flag on next ACK.
-//! 2. Sender receives CN → halves cwnd, sends CWR on next data.
-//! 3. Receiver sees CWR → stops setting CN.
-//! 4. Sender ignores CN flags whose snSourceAck < CWR sequence number.
+//! Loss is the only congestion signal. MS-RDPEUDP2 has no explicit one:
+//! 3.1.1.2.2 names a Congestion Controller as a higher-layer concept for
+//! "inferring the runtime network conditions" and its packet header
+//! (2.2.1.1) carries nothing but payload-presence flags. The CN and CWR
+//! flags belong to MS-RDPEUDP, whose RDPUDP_FEC_HEADER defines them, and
+//! this crate speaks the v2 data transfer.
 //!
-//! This ensures at most one congestion reaction per RTT.
+//! At most one reaction per recovery epoch; see `on_loss`.
 
 /// Initial congestion window size in bytes.
 ///
@@ -42,11 +43,6 @@ pub(crate) struct CongestionControl {
     /// Used for congestion avoidance: increase by 1 MTU per cwnd bytes ACKed.
     bytes_acked: u64,
 
-    /// DataSeqNum of the packet that carried the most recent CWR flag.
-    /// Used to limit congestion reaction to once per loss epoch.
-    /// CN flags with snSourceAck < cwr_seq are stale and ignored.
-    cwr_seq: Option<u64>,
-
     /// Highest DataSeqNum in flight when the window was last reduced by a
     /// locally detected loss.
     ///
@@ -68,7 +64,6 @@ impl CongestionControl {
             window: initial_window,
             ssthresh: u64::MAX,
             bytes_acked: 0,
-            cwr_seq: None,
             recovery_seq: None,
         }
     }
@@ -90,12 +85,6 @@ impl CongestionControl {
     #[cfg(test)]
     pub(crate) fn ssthresh(&self) -> u64 {
         self.ssthresh
-    }
-
-    /// The CWR sequence number, if a congestion response is active.
-    #[cfg(test)]
-    pub(crate) fn cwr_seq(&self) -> Option<u64> {
-        self.cwr_seq
     }
 
     /// Called when an ACK acknowledges new data.
@@ -151,35 +140,7 @@ impl CongestionControl {
         true
     }
 
-    /// Called when a CN (congestion notification) flag is received
-    /// from the remote endpoint.
-    ///
-    /// `ack_seq` is the snSourceAck field from the packet carrying CN.
-    /// Returns `true` if the window was reduced (i.e., this is a new
-    /// congestion epoch), or `false` if the CN was stale.
-    pub(crate) fn on_congestion_notification(&mut self, ack_seq: u64) -> bool {
-        // Ignore stale CN: ack_seq < cwr_seq means this CN is about
-        // a loss that predates our most recent CWR response.
-        if let Some(cwr) = self.cwr_seq {
-            if ack_seq < cwr {
-                return false;
-            }
-        }
-
-        self.halve_window();
-        true
-    }
-
-    /// Record that a CWR flag was sent on the packet with this DataSeqNum.
-    ///
-    /// The connection state machine calls this after sending a packet
-    /// with the CWR flag set. Future CN/loss events below this seq
-    /// are treated as stale.
-    pub(crate) fn set_cwr_seq(&mut self, seq: u64) {
-        self.cwr_seq = Some(seq);
-    }
-
-    /// Halve the window (shared between on_loss and on_congestion_notification).
+    /// Halve the window and set the slow-start threshold to match.
     fn halve_window(&mut self) {
         self.ssthresh = (self.window / 2).max(MIN_WINDOW);
         self.window = self.ssthresh;
@@ -202,7 +163,6 @@ mod tests {
         let cc = CongestionControl::new();
         assert_eq!(cc.window(), INITIAL_WINDOW);
         assert!(cc.in_slow_start()); // ssthresh = MAX
-        assert_eq!(cc.cwr_seq(), None);
     }
 
     #[test]
@@ -294,43 +254,6 @@ mod tests {
 
         assert_eq!(cc.window(), initial / 2);
         assert!(cc.window() > MIN_WINDOW, "the window collapsed to its floor");
-    }
-
-    #[test]
-    fn congestion_notification_reduces_window() {
-        let mut cc = CongestionControl::new();
-        let initial = cc.window();
-
-        assert!(cc.on_congestion_notification(1));
-        assert_eq!(cc.window(), initial / 2);
-    }
-
-    #[test]
-    fn stale_cn_ignored() {
-        let mut cc = CongestionControl::new();
-
-        cc.on_congestion_notification(5);
-        cc.set_cwr_seq(10);
-
-        let window_before = cc.window();
-
-        // CN with ack_seq=7 < cwr_seq=10 → stale
-        assert!(!cc.on_congestion_notification(7));
-        assert_eq!(cc.window(), window_before);
-    }
-
-    #[test]
-    fn cn_after_cwr_epoch_reacts() {
-        let mut cc = CongestionControl::new();
-
-        cc.on_congestion_notification(5);
-        cc.set_cwr_seq(10);
-
-        let window_before = cc.window();
-
-        // CN with ack_seq=15 >= cwr_seq=10 → new epoch
-        assert!(cc.on_congestion_notification(15));
-        assert!(cc.window() < window_before);
     }
 
     #[test]

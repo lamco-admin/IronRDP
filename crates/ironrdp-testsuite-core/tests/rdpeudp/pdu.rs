@@ -678,12 +678,18 @@ fn v2_flags_auto_computed_on_encode() {
     assert!(!decoded.header.flags.contains(V2Flags::ACKVEC));
 }
 
-/// Standalone flags (CN, CWR) are preserved on encode.
+/// The v2 header has no standalone flags, so a bit the caller sets without the
+/// payload it announces does not survive the round trip.
+///
+/// Every flag [MS-RDPEUDP2] 2.2.1.1 defines announces a payload. There is
+/// nothing like the v1 header's CN, CWR or SYNLOSSY, which stand on their own
+/// and have to be carried across.
 #[test]
-fn v2_standalone_flags_preserved() {
+fn v2_has_no_standalone_flags() {
     let packet = V2Packet {
         header: V2Header {
-            flags: V2Flags::ACK | V2Flags::CN | V2Flags::CWR,
+            // ACKVEC announces a payload this packet does not carry.
+            flags: V2Flags::ACK | V2Flags::ACKVEC,
             log_window_size: 6,
         },
         ack: Some(AckPayload {
@@ -704,9 +710,11 @@ fn v2_standalone_flags_preserved() {
     let encoded = encode_vec(&packet).expect("encode");
     let decoded: V2Packet = decode(&encoded).expect("decode");
 
-    assert!(decoded.header.flags.contains(V2Flags::CN));
-    assert!(decoded.header.flags.contains(V2Flags::CWR));
-    assert!(decoded.header.flags.contains(V2Flags::ACK));
+    assert_eq!(
+        decoded.header.flags,
+        V2Flags::ACK,
+        "flags should describe exactly the payloads present"
+    );
 }
 
 /// Encode rejects ACK + ACKVEC both set.
