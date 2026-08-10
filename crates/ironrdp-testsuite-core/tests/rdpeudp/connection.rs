@@ -962,3 +962,44 @@ fn a_client_rejects_a_syn_ack_that_settles_below_version_3() {
         .expect_err("the server settled on the MS-RDPEUDP data transfer");
     assert!(!client.is_established());
 }
+
+/// A transfer longer than the window survives a loss partway through.
+///
+/// A retransmission carries a fresh DataSeqNum, so the lost one is never
+/// filled and [MS-RDPEUDP2] 3.1.1.2.2 will not let the receiver's lower bound
+/// advance over it. The AckOfAcks payload is the only way past, and 3.1.5.3
+/// has the sender advertise it on exactly this event: "the Sender declares the
+/// packet loss and updates its own next sequence number to wait on. It then
+/// sends the AckOfAcks payload ... so that the Receiver can stop waiting for
+/// any packets with lower sequence numbers to arrive."
+///
+/// Sending the peer's own numbers back instead leaves its window pinned on the
+/// hole, and the transfer stops one window later.
+#[test]
+fn a_transfer_survives_a_loss_in_the_middle() {
+    let (mut client, mut server, t) = establish_pair();
+
+    // Well past the 64-slot window implied by log_window_size 6.
+    let chunk_count = 200usize;
+    for i in 0..chunk_count {
+        let byte = u8::try_from(i % 256).expect("modulo 256 fits in u8");
+        client.send(vec![byte; 4]).expect("send");
+    }
+
+    // The first packet never reaches the server.
+    let _lost = client.poll_transmit(later(t, 100)).expect("first data packet");
+
+    advance(&mut client, &mut server, later(t, 30_000));
+
+    let received = drain_received(&mut server);
+    assert_eq!(
+        received.len(),
+        chunk_count,
+        "the transfer stalled: the receiver's window never moved past the hole"
+    );
+
+    for (i, chunk) in received.iter().enumerate() {
+        let byte = u8::try_from(i % 256).expect("modulo 256 fits in u8");
+        assert_eq!(chunk, &vec![byte; 4], "chunk {i} arrived out of order");
+    }
+}

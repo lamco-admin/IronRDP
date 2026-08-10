@@ -308,6 +308,16 @@ impl SendWindow {
         self.entries.iter().filter(|e| e.state == SendEntryState::Pending)
     }
 
+    /// The lowest DataSeqNum still waiting to be acknowledged.
+    ///
+    /// This is what [MS-RDPEUDP2] 2.2.1.2.4 calls "the sequence number the
+    /// Sender is waiting to receive acknowledgment of". Resolved entries are
+    /// drained off the front, so the front is it; with nothing outstanding it
+    /// is the next number that will be assigned.
+    pub(crate) fn lowest_unacknowledged(&self) -> u64 {
+        self.entries.front().map_or(self.next_data_seq, |entry| entry.data_seq)
+    }
+
     /// The highest DataSeqNum that has been acknowledged.
     ///
     /// Returns `None` if no packets have been acknowledged yet.

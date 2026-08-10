@@ -95,12 +95,30 @@ impl RecvWindow {
             return false;
         }
 
-        // The reorder buffer holds at most one entry per window slot. It only
-        // drains when the ChannelSeqNum it is waiting on arrives, so a peer
-        // that keeps sending fresh ones while that packet never comes would
-        // otherwise grow it by one entry per datagram, without bound. Refuse
-        // the packet outright rather than storing it and acknowledging it.
-        if self.reorder_buf.len() >= self.max_entries && !self.reorder_buf.contains_key(&channel_seq) {
+        // A ChannelSeqNum below the delivery cursor belongs to data the
+        // application has already seen, so this is a retransmission of
+        // something we no longer need. Acknowledge it, so the sender stops
+        // resending, but keep it out of the reorder buffer: `drain_ordered`
+        // only ever removes at `next_channel_seq`, so an entry below that
+        // would occupy a slot for the rest of the connection.
+        let already_delivered = channel_seq < self.next_channel_seq;
+
+        // The reorder buffer holds at most one entry per window slot. It
+        // drains only at `next_channel_seq`, so a peer that keeps sending
+        // fresh numbers while withholding that one would otherwise grow it by
+        // an entry per datagram, without bound. Refuse such a packet outright
+        // rather than storing it and acknowledging it.
+        //
+        // Never refuse the packet at `next_channel_seq` itself. It is the one
+        // that empties the buffer, and it is by definition not in it, so a
+        // plain "full, and not already present" test rejects precisely the
+        // packet that would resolve the situation and reassembly stops for
+        // good.
+        if !already_delivered
+            && channel_seq != self.next_channel_seq
+            && self.reorder_buf.len() >= self.max_entries
+            && !self.reorder_buf.contains_key(&channel_seq)
+        {
             return false;
         }
 
@@ -128,7 +146,9 @@ impl RecvWindow {
         }
 
         // Buffer data for reassembly by ChannelSeqNum.
-        self.reorder_buf.insert(channel_seq, data);
+        if !already_delivered {
+            self.reorder_buf.insert(channel_seq, data);
+        }
 
         true
     }
@@ -379,6 +399,65 @@ mod tests {
     fn ack_vector_empty() {
         let w = RecvWindow::new(1, 100, 6);
         assert!(w.ack_vector().is_empty());
+    }
+
+    /// The buffer is bounded, but the packet that empties it is exempt.
+    ///
+    /// A cap of "full, and not already buffered" rejects precisely the
+    /// ChannelSeqNum the buffer is waiting on, because that one is by
+    /// definition not in it. Reassembly then never restarts.
+    #[test]
+    fn the_packet_that_drains_the_buffer_is_never_refused() {
+        let window = 1usize << 4;
+        let mut w = RecvWindow::new(1, 1, 4);
+        let mut data_seq = 1u64;
+
+        // ChannelSeqNum 1 goes missing. Everything after it arrives, and each
+        // acknowledgment slides the window on, so the buffer fills to its cap.
+        for channel_seq in 2..=u64::try_from(window * 2).expect("window fits in u64") {
+            w.receive(data_seq, channel_seq, vec![0xAB]);
+            w.release_acknowledged();
+            data_seq += 1;
+        }
+
+        assert_eq!(w.reorder_buf_len(), window, "the buffer should be at its cap");
+        assert!(w.drain_ordered().is_empty(), "nothing is deliverable yet");
+
+        // The sender retransmits the missing datum. [MS-RDPEUDP2] gives the
+        // retransmission a fresh DataSeqNum and keeps the ChannelSeqNum.
+        assert!(
+            w.receive(w.base_seq(), 1, vec![0x01]),
+            "the packet that drains the buffer was refused"
+        );
+
+        assert_eq!(
+            w.drain_ordered().len(),
+            window + 1,
+            "the missing datum should release everything behind it"
+        );
+    }
+
+    /// Data the application has already seen must not take a buffer slot.
+    ///
+    /// `drain_ordered` only removes at `next_channel_seq`, so an entry below
+    /// it is never collected and holds its slot for the rest of the
+    /// connection.
+    #[test]
+    fn a_redelivered_channel_seq_is_acknowledged_but_not_buffered() {
+        let mut w = RecvWindow::new(1, 1, 4);
+
+        assert!(w.receive(1, 1, vec![0xAA]));
+        assert_eq!(w.drain_ordered(), vec![vec![0xAA]]);
+        assert_eq!(w.reorder_buf_len(), 0);
+
+        // The sender did not see our acknowledgment and resent the datum under
+        // a new DataSeqNum.
+        assert!(
+            w.receive(2, 1, vec![0xAA]),
+            "the duplicate should still be acknowledged"
+        );
+        assert_eq!(w.reorder_buf_len(), 0, "and it should not occupy a slot");
+        assert!(w.drain_ordered().is_empty());
     }
 
     /// The reorder buffer is bounded by the window. A peer sending packets

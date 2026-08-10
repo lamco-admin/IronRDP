@@ -283,8 +283,25 @@ pub struct RdpeudpConnection {
     /// Whether the remote has gaps (we should set CN on our ACKs).
     cn_pending: bool,
 
-    /// The AckOfAcks sequence number to send (if any).
-    pending_ack_of_acks: Option<u16>,
+    /// The DataSeqNum we are waiting to see acknowledged, when the peer still
+    /// needs telling.
+    ///
+    /// [MS-RDPEUDP2] 2.2.1.2.4 defines AckOfAcksSeqNum as "the sequence number
+    /// the Sender is waiting to receive acknowledgment of", and 3.1.5.3 has
+    /// the sender advertise it after declaring a loss, "so that the Receiver
+    /// can stop waiting for any packets with lower sequence numbers to
+    /// arrive".
+    ///
+    /// This is the only thing that can move a receiver past a packet we gave
+    /// up on. The retransmission carries a fresh DataSeqNum, so the lost one
+    /// is never filled, and 3.1.1.2.2 lets a receiver advance its lower bound
+    /// only over received packets or on this payload. Without it the peer's
+    /// window sits on the hole until it fills, and the connection stops
+    /// carrying data one window later.
+    ///
+    /// Held as the full 64-bit value and truncated on the wire, so it can be
+    /// compared against what the peer reports.
+    pending_ack_of_acks: Option<u64>,
 
     /// The last handshake datagram we put on the wire, kept so it can go
     /// out again. [MS-RDPEUDP] 1.3.1 delivers the SYN, the SYN+ACK and the
@@ -1040,8 +1057,8 @@ impl RdpeudpConnection {
         // Update retransmit timer
         self.update_retransmit_timer(now);
 
-        // Generate AckOfAcks to let remote advance their recv window base
-        self.pending_ack_of_acks = Some(ack.seq_num);
+        // 3.1.5.3: stop advertising once the peer acknowledges past it.
+        self.retire_ack_of_acks(acked_seq);
     }
 
     /// Process a selective ACK vector.
@@ -1125,7 +1142,11 @@ impl RdpeudpConnection {
 
         self.run_loss_detection(now);
         self.update_retransmit_timer(now);
-        self.pending_ack_of_acks = Some(ack_vector.base_seq_num);
+
+        // 3.1.5.3 also retires it on "an acknowledgment vector with its lowest
+        // sequence number still missing that is higher than the AckOfAck
+        // sequence number", which is this vector's base.
+        self.retire_ack_of_acks(base);
     }
 
     /// Process an AckOfAcks payload: advance our recv window base.
@@ -1228,11 +1249,34 @@ impl RdpeudpConnection {
             return;
         };
 
+        // Losing the packet moved the front of the window past it, and the
+        // retransmission will carry a new DataSeqNum, so this one is never
+        // going to be acknowledged. Tell the peer where we have got to, or its
+        // receive window will sit on the hole forever (3.1.5.3).
+        let lowest_unacknowledged = send_window.lowest_unacknowledged();
+
         self.congestion.on_loss(data_seq, largest_sent);
         self.reliability.enqueue(info.channel_seq, info.data);
+        self.pending_ack_of_acks = Some(lowest_unacknowledged);
 
         // Retransmissions always carry CWR.
         self.cwr_pending = true;
+    }
+
+    /// Stop advertising the AckOfAcks once the peer has moved past it.
+    ///
+    /// [MS-RDPEUDP2] 3.1.5.3: the sender "should stop sending this payload
+    /// when either it receives an acknowledgment that has a sequence number
+    /// that is higher than the AckOfAck sequence number, or it receives an
+    /// acknowledgment vector with its lowest sequence number still missing
+    /// that is higher than the AckOfAck sequence number".
+    fn retire_ack_of_acks(&mut self, peer_reported_seq: u64) {
+        if self
+            .pending_ack_of_acks
+            .is_some_and(|advertised| peer_reported_seq > advertised)
+        {
+            self.pending_ack_of_acks = None;
+        }
     }
 
     /// Declare the oldest unacknowledged packet lost because the retransmit
@@ -1405,7 +1449,7 @@ impl RdpeudpConnection {
 
         // AckOfAcks if pending
         let ack_of_acks = self.pending_ack_of_acks.map(|seq| AckOfAcksPayload {
-            ack_of_acks_seq_num: seq,
+            ack_of_acks_seq_num: seq::truncate_seq(seq),
         });
         if ack_of_acks.is_some() {
             flags |= V2Flags::AOA;
@@ -1437,7 +1481,6 @@ impl RdpeudpConnection {
             self.timers.clear(Timer::AckDelay);
             self.commit_acknowledgement();
         }
-        self.pending_ack_of_acks = None;
 
         Some(transmit)
     }
@@ -1455,7 +1498,7 @@ impl RdpeudpConnection {
         }
 
         let ack_of_acks = self.pending_ack_of_acks.map(|seq| AckOfAcksPayload {
-            ack_of_acks_seq_num: seq,
+            ack_of_acks_seq_num: seq::truncate_seq(seq),
         });
         if ack_of_acks.is_some() {
             flags |= V2Flags::AOA;
@@ -1477,7 +1520,6 @@ impl RdpeudpConnection {
         // Same ordering as the data path: the window only moves past packets
         // whose acknowledgment actually made it into a packet.
         self.commit_acknowledgement();
-        self.pending_ack_of_acks = None;
 
         Some(transmit)
     }
