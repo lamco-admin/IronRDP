@@ -67,18 +67,22 @@ impl PacketPrefixByte {
     }
 
     /// Encode to a single byte.
+    ///
+    /// [MS-RDPEUDP2] 2.2.1.3 numbers the bits least-significant first, as its
+    /// little-endian byte order implies: bit 0 is Reserved, bits 1 to 4 are
+    /// Packet_Type_Index, bits 5 to 7 are Short_Packet_Length. The worked
+    /// example in 3.1.1.1.5.1 pins it down: a prefix byte of 0x10 is
+    /// Packet_Type_Index 8, which is the dummy-packet value, and is only
+    /// reachable under this numbering.
     fn to_byte(self) -> u8 {
-        // bit 7 = reserved (0)
-        // bits 3-6 = packet_type_index
-        // bits 0-2 = short_packet_length
-        ((self.packet_type_index & 0x0F) << 3) | (self.short_packet_length & 0x07)
+        ((self.short_packet_length & 0x07) << 5) | ((self.packet_type_index & 0x0F) << 1)
     }
 
     /// Decode from a single byte.
     fn from_byte(byte: u8) -> Self {
         Self {
-            packet_type_index: (byte >> 3) & 0x0F,
-            short_packet_length: byte & 0x07,
+            packet_type_index: (byte >> 1) & 0x0F,
+            short_packet_length: (byte >> 5) & 0x07,
         }
     }
 }
@@ -247,8 +251,9 @@ mod tests {
             short_packet_length: 4,
         };
         let byte = prefix.to_byte();
-        // packet_type_index=8 → bits 3-6 = 0b1000 → byte bits = 0b0_1000_100 = 0x44
-        assert_eq!(byte, 0x44);
+        // Short_Packet_Length 4 in bits 5-7 and Packet_Type_Index 8 in bits 1-4:
+        // 0b100_1000_0 = 0x90.
+        assert_eq!(byte, 0x90);
         let decoded = PacketPrefixByte::from_byte(byte);
         assert_eq!(prefix, decoded);
     }
@@ -256,9 +261,10 @@ mod tests {
     /// MS-RDPEUDP2 Section 3.1.1.1.5.1 worked example.
     ///
     /// Input: 10 bytes [0x30, 0x35, 0x56, 0x78, 0xa2, 0x36, 0x73, 0xee, 0x68, 0xf2]
-    /// PacketPrefixByte = 0x10 (packet_type_index=2? Actually the spec says 0x10 which
-    /// is packet_type_index=0b0010=2, but the spec says it must be 0 or 8.
-    /// This is the spec's own example, so we follow it exactly.)
+    /// PacketPrefixByte = 0x10, which is Packet_Type_Index 8 (a dummy packet) and
+    /// Short_Packet_Length 0. This example is what fixes the bit numbering: 8 is
+    /// a legal type and 2 is not, and only least-significant-first numbering
+    /// reads 0x10 as 8.
     ///
     /// After prepend: [0x10, 0x30, 0x35, 0x56, 0x78, 0xa2, 0x36, 0x73, 0xee, 0x68, 0xf2]
     /// After swap[0]↔[7]: [0x73, 0x30, 0x35, 0x56, 0x78, 0xa2, 0x36, 0x10, 0xee, 0x68, 0xf2]
@@ -293,8 +299,8 @@ mod tests {
     ///
     /// The spec's worked example uses packet_type_index=2, which is not
     /// a valid value for normal operation (only 0 and 8 are valid).
-    /// We test the byte-swap mechanics manually rather than going through
-    /// decode_with_prefix, which correctly rejects packet_type_index=2.
+    /// The swap mechanics are exercised directly here so the assertion is about
+    /// the prefix byte itself rather than about the surrounding framing.
     #[test]
     fn spec_example_receive_transform() {
         let mut wire = vec![0x73, 0x30, 0x35, 0x56, 0x78, 0xa2, 0x36, 0x10, 0xee, 0x68, 0xf2];
@@ -305,8 +311,8 @@ mod tests {
         // After swap: prefix byte is now at position 0
         let prefix = PacketPrefixByte::from_byte(wire[0]);
         assert_eq!(prefix.to_byte(), 0x10);
-        // packet_type_index = (0x10 >> 3) & 0x0F = 2 (spec example value)
-        assert_eq!(prefix.packet_type_index, 2);
+        assert_eq!(prefix.packet_type_index, 8, "0x10 is the dummy-packet type");
+        assert_eq!(prefix.short_packet_length, 0);
 
         // Step 2: The original packet is everything after the prefix byte
         let packet = &wire[1..];
@@ -384,5 +390,25 @@ mod tests {
         assert!(!prefix.is_dummy());
         assert_eq!(prefix.short_packet_length, 7);
         assert_eq!(decoded_packet, &*packet);
+    }
+    /// Only Packet_Type_Index 0 and 8 are legal, and the encoding must place
+    /// them where a peer looks for them.
+    ///
+    /// [MS-RDPEUDP2] 3.1.1.1.5 fixes the two values, so any layout that cannot
+    /// represent both without touching the reserved bit is wrong.
+    #[test]
+    fn prefix_byte_layout_matches_the_legal_type_values() {
+        for length in 0..=7u8 {
+            for packet_type_index in [0u8, 8] {
+                let prefix = PacketPrefixByte {
+                    packet_type_index,
+                    short_packet_length: length,
+                };
+                let byte = prefix.to_byte();
+
+                assert_eq!(byte & 0x01, 0, "the reserved bit must stay clear");
+                assert_eq!(PacketPrefixByte::from_byte(byte), prefix);
+            }
+        }
     }
 }
