@@ -25,6 +25,13 @@ use tracing::{debug, warn};
 /// How long the full UDP accept sequence (initial datagram, RDPEUDP2
 /// handshake, TLS, RDPEMT tunnel creation) may take before giving up and
 /// continuing TCP-only.
+///
+/// This bounds the background task only (see `server.rs`'s
+/// `accept_finalize`, which spawns [`accept`] rather than awaiting it
+/// inline): the main handshake never waits anywhere near this long, so the
+/// value here is generous on purpose, favoring a real chance for a
+/// legitimately slow client/network to still complete the handshake over
+/// cutting it off early.
 const UDP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Shared handle to an established sideband UDP transport.

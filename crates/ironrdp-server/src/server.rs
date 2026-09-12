@@ -4134,6 +4134,18 @@ impl RdpServer {
         // re-bootstrapped for a resize (see the acceptor's own doc comment
         // on `MultitransportBootstrapping` regarding reactivation).
         let mut udp_transport: Option<multitransport::UdpTransportHandle> = None;
+        // Set by the `multitransport_handler` below (spawned, not awaited
+        // inline — see its own comment) and resolved just after `finalize`
+        // returns, bounded by `UDP_ACCEPT_GRACE` rather than the full
+        // `multitransport::UDP_ACCEPT_TIMEOUT`: the handshake is either fast
+        // (same-LAN UDP+TLS+tunnel setup, sub-second) or the client never
+        // attempts it at all (observed with at least one real client), so
+        // waiting the full internal timeout here would just reintroduce the
+        // stall this is fixing. A slower-but-real handshake that misses the
+        // grace window is abandoned for this connection, matching the
+        // existing "optional sideband, never fatal" posture.
+        let mut udp_accept_task: Option<task::JoinHandle<Option<multitransport::UdpTransportHandle>>> = None;
+        const UDP_ACCEPT_GRACE: Duration = Duration::from_millis(1500);
 
         loop {
             // Bounded: see `FINALIZE_TIMEOUT`. The bound belongs on THIS call
@@ -4160,7 +4172,20 @@ impl RdpServer {
                     let (Some(udp_bind_addr), Some(tls_config)) = (udp_bind_addr, tls_config.clone()) else {
                         return;
                     };
-                    udp_transport = multitransport::accept(udp_bind_addr, tls_config, &request).await;
+                    // Spawned, not awaited: this handler must return
+                    // promptly or the RDP handshake stalls behind it (see
+                    // `accept_finalize_with_multitransport`'s own doc
+                    // comment). Awaiting `multitransport::accept` here
+                    // directly — its internal timeout is 15s — used to block
+                    // the rest of finalize (Demand Active, capability
+                    // exchange, ...) behind it, which is longer than common
+                    // clients' own patience for that: FreeRDP gives up
+                    // waiting for activation after ~10s and disconnects
+                    // first, so the connection failed outright instead of
+                    // falling back to TCP-only as intended.
+                    udp_accept_task = Some(task::spawn(async move {
+                        multitransport::accept(udp_bind_addr, tls_config, &request).await
+                    }));
                 },
             );
             let (new_framed, result) = match tokio::time::timeout(FINALIZE_TIMEOUT, finalize).await {
@@ -4176,6 +4201,16 @@ impl RdpServer {
                     ));
                 }
             };
+
+            // Give a same-LAN UDP+TLS+tunnel handshake a real but short
+            // chance to land before proceeding — see `UDP_ACCEPT_GRACE`.
+            if let Some(task) = udp_accept_task.take() {
+                udp_transport = tokio::time::timeout(UDP_ACCEPT_GRACE, task)
+                    .await
+                    .ok()
+                    .and_then(|joined| joined.ok())
+                    .flatten();
+            }
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 
