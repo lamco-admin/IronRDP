@@ -121,7 +121,16 @@ pub(crate) async fn accept(
             Some(UdpTransportHandle::new(transport))
         }
         Err(error) => {
-            warn!(%error, "Failed to establish sideband UDP transport, continuing TCP-only");
+            // `{error}` (Display) only ever prints the top-level variant name
+            // (e.g. "RDP-UDP handshake failed") -- `.report()` walks the full
+            // `source()` chain down to the actual io::Error/protocol
+            // rejection, which is what's actually needed to tell "peer reset
+            // the connection" apart from "malformed handshake datagram" apart
+            // from "timed out with no response at all."
+            warn!(
+                error = %error.report().with_locations(),
+                "Failed to establish sideband UDP transport, continuing TCP-only"
+            );
             None
         }
     }

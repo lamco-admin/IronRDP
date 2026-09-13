@@ -4065,7 +4065,24 @@ impl RdpServer {
                 }
             }
             Err(error) => {
-                warn!(error = format!("{error:#}"), "Unhandled MCS message channel PDU");
+                // Temporary, obvious diagnostic: a real Windows client (mstsc)
+                // has been observed sending a message-channel PDU that fails
+                // this decode exactly once per session, while every other
+                // tested client (rdpdo, xfreerdp3) decodes cleanly. Dumping
+                // the raw bytes lets the next capture show precisely what
+                // mstsc actually sent instead of guessing at a fix blind.
+                // Remove once root-caused.
+                warn!(
+                    error = format!("{error:#}"),
+                    raw_hex = %data
+                        .user_data
+                        .as_ref()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    "Unhandled MCS message channel PDU"
+                );
             }
         }
     }
