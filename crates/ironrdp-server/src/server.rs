@@ -4235,9 +4235,6 @@ impl RdpServer {
                     "Received Initiate Multitransport Response"
                 );
             }
-            Ok(pdu) => {
-                warn!(?pdu, "Unhandled MCS message channel PDU");
-            }
             Err(error) => {
                 warn!(error = format!("{error:#}"), "Unhandled MCS message channel PDU");
             }
