@@ -107,7 +107,7 @@ fn monotonic_now_ms() -> u64 {
 /// Ready state"). Used to demote those rejections from connection-fatal to
 /// drop-and-warn for clipboard server events that raced a connection
 /// transition (see the `ServerEvent::Clipboard` dispatch in the run loop).
-fn is_cliprdr_not_ready(e: &PduError) -> bool {
+fn is_cliprdr_not_ready(e: &ironrdp_pdu::PduError) -> bool {
     matches!(
         e.kind(),
         ironrdp_pdu::PduErrorKind::Other {
