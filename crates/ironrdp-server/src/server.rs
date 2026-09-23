@@ -103,6 +103,19 @@ fn monotonic_now_ms() -> u64 {
     u64::try_from(EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// True for `Cliprdr::require_ready` rejections ("clipboard channel is not in
+/// Ready state"). Used to demote those rejections from connection-fatal to
+/// drop-and-warn for clipboard server events that raced a connection
+/// transition (see the `ServerEvent::Clipboard` dispatch in the run loop).
+fn is_cliprdr_not_ready(e: &PduError) -> bool {
+    matches!(
+        e.kind(),
+        ironrdp_pdu::PduErrorKind::Other {
+            description: "clipboard channel is not in Ready state",
+        }
+    )
+}
+
 /// Action to take after a client disconnects.
 ///
 /// Returned by [`ConnectionHandler::on_disconnected`] to control whether
@@ -1968,7 +1981,7 @@ impl RdpServer {
                         warn!("No clipboard channel, dropping event");
                         continue;
                     };
-                    let msgs = match c {
+                    let msgs = match match c {
                         ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
                         ClipboardMessage::SendInitiateFileCopy(files) => cliprdr.initiate_file_copy(files),
                         ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
@@ -1979,8 +1992,22 @@ impl RdpServer {
                             error!(?error, "Handling clipboard event");
                             continue;
                         }
-                    }
-                    .map_err_kind("failed to send clipboard event", ServerErrorKind::Pdu)?;
+                    } {
+                        Ok(msgs) => msgs,
+                        Err(e) if is_cliprdr_not_ready(&e) => {
+                            // Clipboard events can outlive the connection they were
+                            // built for: the server event queue persists across
+                            // connections, so e.g. a FormatDataResponse parked between
+                            // connections (or racing a teardown) is drained by the NEXT
+                            // connection before its CLIPRDR channel reaches Ready.
+                            // Propagating the not-Ready rejection out of the run loop
+                            // kills the fresh connection — drop-and-warn instead.
+                            // Every other error stays fatal.
+                            warn!(error = ?e, "dropping stale clipboard event: channel not Ready");
+                            continue;
+                        }
+                        err => err.map_err_kind("failed to send clipboard event", ServerErrorKind::Pdu)?,
+                    };
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| ServerError::channel("SVC channel not found"))?;
