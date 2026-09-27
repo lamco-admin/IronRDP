@@ -26,6 +26,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
+use tracing::{debug, info, trace, warn};
 
 use crate::driver::Driver;
 use crate::error::{DriverError, DriverErrorExt as _, DriverErrorKind, UdpTransportError, UdpTransportErrorExt as _};
@@ -231,6 +232,7 @@ impl UdpTransportSender {
     /// `PayloadLength` field's capacity ([MS-RDPEMT] 2.2.2.3).
     pub async fn send(&self, data: Vec<u8>) -> Result<(), UdpTransportError> {
         if data.len() > usize::from(u16::MAX) {
+            debug!(len = data.len(), "Rejected oversized tunnel payload");
             return Err(UdpTransportError::payload_too_large("send", data.len()));
         }
 
@@ -316,6 +318,8 @@ impl UdpTransport {
     /// once the send channel is dropped, below. Then waits for all
     /// three background tasks to complete.
     pub async fn shutdown(mut self) -> Result<(), UdpTransportError> {
+        debug!("Shutting down UDP transport");
+
         // Drop the send channel to signal the write pump to stop
         drop(self.data_tx);
         drop(self.data_rx);
@@ -354,11 +358,16 @@ impl UdpTransport {
         };
 
         driver.abort();
-        match driver.await {
+        let result = match driver.await {
             Ok(Ok(())) | Err(_) => Ok(()),
             Ok(Err(e)) if matches!(e.kind(), DriverErrorKind::ConnectionClosed) => Ok(()),
             Ok(Err(e)) => Err(UdpTransportError::driver("shutdown", e)),
+        };
+        match &result {
+            Ok(()) => debug!("UDP transport shut down"),
+            Err(error) => debug!(%error, "UDP transport shut down with a driver error"),
         }
+        result
     }
 
     /// Whether the driver task is still running.
@@ -400,11 +409,13 @@ fn driver_exit_during_handshake(
     context: &'static str,
     join_result: Result<Result<(), DriverError>, tokio::task::JoinError>,
 ) -> UdpTransportError {
-    match join_result {
+    let error = match join_result {
         Ok(Ok(())) => UdpTransportError::handshake(context, DriverError::connection_closed(context)),
         Ok(Err(error)) => UdpTransportError::handshake(context, error),
         Err(_) => UdpTransportError::driver_panic(context),
-    }
+    };
+    debug!(%error, "UDP driver exited during the RDP-UDP handshake");
+    error
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -434,16 +445,20 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
-    let socket = UdpSocket::bind(bind_addr)
-        .await
-        .map_err(|error| UdpTransportError::socket("connect udp", error))?;
-    socket
-        .connect(config.server_addr)
-        .await
-        .map_err(|error| UdpTransportError::socket("connect udp", error))?;
+    debug!(peer = %config.server_addr, "Connecting UDP transport");
 
-    tracing::debug!(
-        server = %config.server_addr,
+    let socket = UdpSocket::bind(bind_addr).await.map_err(|error| {
+        debug!(%error, %bind_addr, "Failed to bind UDP socket");
+        UdpTransportError::socket("connect udp", error)
+    })?;
+    socket.connect(config.server_addr).await.map_err(|error| {
+        debug!(%error, peer = %config.server_addr, "Failed to connect UDP socket");
+        UdpTransportError::socket("connect udp", error)
+    })?;
+
+    debug!(
+        peer = %config.server_addr,
+        local_addr = ?socket.local_addr().ok(),
         "UDP socket bound, starting RDPEUDP2 handshake"
     );
 
@@ -476,6 +491,7 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
             return Err(driver_exit_during_handshake("connect udp", join_result));
         }
         () = tokio::time::sleep(config.handshake_timeout) => {
+            debug!(timeout = ?config.handshake_timeout, "RDP-UDP handshake timed out");
             return Err(UdpTransportError::handshake_timeout("connect udp"));
         }
     }
@@ -486,7 +502,7 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
         return Err(driver_exit_during_handshake("connect udp", driver.await));
     }
 
-    tracing::debug!("RDPEUDP2 handshake complete, starting TLS");
+    debug!("RDPEUDP2 handshake complete, starting TLS");
 
     // Phase 3: TLS handshake over the RDPEUDP2 stream
     let rdpeudp_stream = RdpeudpStream::new(Arc::clone(&shared));
@@ -501,10 +517,16 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
         ),
     )
     .await
-    .map_err(|_| UdpTransportError::tls_timeout("connect udp"))?
-    .map_err(|error| UdpTransportError::tls("connect udp", error))?;
+    .map_err(|_| {
+        debug!(timeout = ?config.tls_timeout, "TLS handshake timed out");
+        UdpTransportError::tls_timeout("connect udp")
+    })?
+    .map_err(|error| {
+        debug!(%error, "TLS handshake failed");
+        UdpTransportError::tls("connect udp", error)
+    })?;
 
-    tracing::debug!("TLS handshake complete, starting RDPEMT tunnel negotiation");
+    debug!("TLS handshake complete, starting RDPEMT tunnel negotiation");
 
     // Phase 4: RDPEMT tunnel handshake
     //
@@ -517,9 +539,13 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
         establish_tunnel_split(&mut tls_read, &mut tls_write, config.tunnel_config),
     )
     .await
-    .map_err(|_| UdpTransportError::tunnel_timeout("connect udp"))??;
+    .map_err(|_| {
+        debug!(timeout = ?config.tunnel_timeout, "RDPEMT tunnel negotiation timed out");
+        UdpTransportError::tunnel_timeout("connect udp")
+    })?
+    .inspect_err(|error| debug!(%error, "RDPEMT tunnel negotiation failed"))?;
 
-    tracing::debug!("RDPEMT tunnel established, starting data pump");
+    debug!("RDPEMT tunnel established, starting data pump");
 
     // Phase 5: Set up data channels and spawn the read pump
     let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -534,6 +560,8 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
     let write_pump_handle = AbortOnDrop::new(tokio::spawn(async move {
         write_pump(&mut tls_write, &mut outgoing_rx).await
     }));
+
+    info!(peer = %config.server_addr, "UDP transport established");
 
     Ok(UdpTransport {
         data_rx: incoming_rx,
@@ -560,6 +588,7 @@ where
     // Send CreateRequest
     if let Some(pdu_bytes) = tunnel.poll_pdu() {
         write_tunnel_pdu(writer, &pdu_bytes).await?;
+        debug!(len = pdu_bytes.len(), "Sent tunnel create request");
     }
 
     // Read CreateResponse. The peer closing before it arrives is a failed
@@ -614,29 +643,36 @@ where
 /// Returns `UdpTransportError` if any phase of the accept fails.
 pub async fn accept_udp(socket: UdpSocket, config: UdpAcceptConfig) -> Result<UdpTransport, UdpTransportError> {
     // Wrap the entire accept sequence in a timeout
+    let config_timeout = config.accept_timeout;
     tokio::time::timeout(config.accept_timeout, accept_udp_inner(socket, config))
         .await
-        .map_err(|_| UdpTransportError::handshake_timeout("accept udp"))?
+        .map_err(|_| {
+            debug!(timeout = ?config_timeout, "UDP accept timed out");
+            UdpTransportError::handshake_timeout("accept udp")
+        })?
 }
 
 async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<UdpTransport, UdpTransportError> {
     // Phase 1: Receive the initial SYN datagram and learn the client address
     let mut recv_buf = vec![0u8; 9000];
-    let (n, client_addr) = socket
-        .recv_from(&mut recv_buf)
-        .await
-        .map_err(|error| UdpTransportError::socket("accept udp inner", error))?;
+    debug!(local_addr = ?socket.local_addr().ok(), "Waiting for the initial UDP datagram");
 
-    tracing::debug!(client = %client_addr, "Received initial datagram, decoding SYN");
+    let (n, client_addr) = socket.recv_from(&mut recv_buf).await.map_err(|error| {
+        debug!(%error, "Failed to receive the initial UDP datagram");
+        UdpTransportError::socket("accept udp inner", error)
+    })?;
+
+    debug!(peer = %client_addr, len = n, "Received initial datagram, decoding SYN");
 
     // Connect the socket to the client so the driver can use send/recv
-    socket
-        .connect(client_addr)
-        .await
-        .map_err(|error| UdpTransportError::socket("accept udp inner", error))?;
+    socket.connect(client_addr).await.map_err(|error| {
+        debug!(%error, peer = %client_addr, "Failed to connect UDP socket");
+        UdpTransportError::socket("accept udp inner", error)
+    })?;
 
     // Phase 2: Decode the V1 SYN datagram and create a server-side connection
-    let syn_datagram: V1Datagram = ironrdp_core::decode(&recv_buf[..n]).map_err(|_| {
+    let syn_datagram: V1Datagram = ironrdp_core::decode(&recv_buf[..n]).map_err(|error| {
+        warn!(%error, peer = %client_addr, len = n, "Failed to decode initial SYN datagram");
         UdpTransportError::handshake(
             "accept UDP",
             DriverError::rdpeudp(
@@ -650,6 +686,7 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
     connection_config.cookie_hash = Some(cookie_hash(&config.tunnel_config));
 
     let conn = RdpeudpConnection::accept(connection_config, &syn_datagram, Clock::new().now()).map_err(|error| {
+        warn!(%error, peer = %client_addr, "Rejected initial SYN datagram");
         UdpTransportError::handshake("accept UDP", DriverError::rdpeudp("accept RDP-UDP connection", error))
     })?;
 
@@ -682,22 +719,25 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
         return Err(driver_exit_during_handshake("accept udp inner", driver.await));
     }
 
-    tracing::debug!("RDPEUDP2 server handshake complete, starting TLS accept");
+    debug!("RDPEUDP2 server handshake complete, starting TLS accept");
 
     // Phase 4: TLS server-side handshake
     let rdpeudp_stream = RdpeudpStream::new(Arc::clone(&shared));
-    let tls_stream = tls_accept(rdpeudp_stream, config.tls_config)
-        .await
-        .map_err(|error| UdpTransportError::tls("accept udp inner", error))?;
+    let tls_stream = tls_accept(rdpeudp_stream, config.tls_config).await.map_err(|error| {
+        debug!(%error, "TLS accept failed");
+        UdpTransportError::tls("accept udp inner", error)
+    })?;
 
-    tracing::debug!("TLS accept complete, starting RDPEMT tunnel negotiation");
+    debug!("TLS accept complete, starting RDPEMT tunnel negotiation");
 
     // Phase 5: RDPEMT server-side tunnel handshake
     let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
 
-    let mut tunnel = establish_tunnel_server_split(&mut tls_read, &mut tls_write, config.tunnel_config).await?;
+    let mut tunnel = establish_tunnel_server_split(&mut tls_read, &mut tls_write, config.tunnel_config)
+        .await
+        .inspect_err(|error| debug!(%error, "RDPEMT tunnel negotiation failed"))?;
 
-    tracing::debug!("RDPEMT server tunnel established, starting data pump");
+    debug!("RDPEMT server tunnel established, starting data pump");
 
     // Phase 6: Set up data channels and spawn pumps (identical to client side)
     let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -711,6 +751,8 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
     let write_pump_handle = AbortOnDrop::new(tokio::spawn(async move {
         write_pump(&mut tls_write, &mut outgoing_rx).await
     }));
+
+    info!(peer = %client_addr, "UDP transport accepted");
 
     Ok(UdpTransport {
         data_rx: incoming_rx,
@@ -755,6 +797,7 @@ where
     // Send CreateResponse
     if let Some(pdu_bytes) = tunnel.poll_pdu() {
         write_tunnel_pdu(writer, &pdu_bytes).await?;
+        debug!(len = pdu_bytes.len(), "Sent tunnel create response");
     }
 
     match tunnel.poll_event() {
@@ -780,21 +823,24 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     while let Some(data) = outgoing_rx.recv().await {
+        let len = data.len();
         let pdu = ironrdp_rdpemt::TunnelData {
             sub_headers: Vec::new(),
             higher_layer_data: data,
         };
         let encoded = ironrdp_core::encode_vec(&pdu)
             .map_err(|error| UdpTransportError::rdpemt("write pump", ironrdp_rdpemt::RdpemtError::encode(error)))?;
-        tls_write
-            .write_all(&encoded)
-            .await
-            .map_err(|error| UdpTransportError::tls("write pump", error))?;
-        tls_write
-            .flush()
-            .await
-            .map_err(|error| UdpTransportError::tls("write pump", error))?;
+        tls_write.write_all(&encoded).await.map_err(|error| {
+            debug!(%error, "Write pump failed to write tunnel data");
+            UdpTransportError::tls("write pump", error)
+        })?;
+        tls_write.flush().await.map_err(|error| {
+            debug!(%error, "Write pump failed to flush tunnel data");
+            UdpTransportError::tls("write pump", error)
+        })?;
+        trace!(len, encoded_len = encoded.len(), "Sent tunnel data");
     }
+    debug!("Write pump stopped, send channel closed");
     Ok(())
 }
 
