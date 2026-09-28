@@ -54,30 +54,17 @@ impl UdpTransportHandle {
 
     /// Sends one higher-layer (raw DVC) payload over the tunnel.
     ///
-    /// Returns whether the send succeeded; a failure is logged here rather
-    /// than propagated; the caller's fallback is simply to have sent nothing
-    /// over UDP for this batch; the RDP session itself never fails over an
-    /// optional sideband transport.
-    #[cfg_attr(
-        not(feature = "egfx"),
-        expect(
-            dead_code,
-            reason = "only consumer today is the EGFX outgoing path, gated on the egfx feature"
-        )
-    )]
-    pub(crate) async fn send(&self, data: Vec<u8>) -> bool {
-        self.send_message(TunnelMessage::from(data)).await
+    /// A failure is logged here rather than propagated: The RDP session never
+    /// fails over an optional sideband transport.
+    pub(crate) async fn send(&self, data: Vec<u8>) {
+        self.send_message(TunnelMessage::from(data)).await;
     }
 
     /// Sends one Tunnel Data PDU's content, sub-headers included; failures
     /// are handled as in [`Self::send`].
-    pub(crate) async fn send_message(&self, message: TunnelMessage) -> bool {
-        match self.sender.send_message(message).await {
-            Ok(()) => true,
-            Err(error) => {
-                warn!(%error, "Failed to send data over UDP transport");
-                false
-            }
+    pub(crate) async fn send_message(&self, message: TunnelMessage) {
+        if let Err(error) = self.sender.send_message(message).await {
+            warn!(%error, "Failed to send data over UDP transport");
         }
     }
 
