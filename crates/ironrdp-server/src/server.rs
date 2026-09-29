@@ -854,9 +854,6 @@ pub struct RdpServer {
     /// Whether the current connection's EGFX data has started going over the
     /// sideband transport, so the switch is logged once.
     egfx_on_udp: bool,
-    /// Whether the last bandwidth measurement went out on the sideband
-    /// transport, so that transport closing can cancel it.
-    bandwidth_measure_on_udp: bool,
     /// Tunnel payloads that arrived while a Soft-Sync request was waiting for
     /// its response. The client writes on the tunnel right after sending the
     /// response over TCP, so its first tunnel data can overtake it; this holds
@@ -1578,7 +1575,6 @@ impl RdpServer {
             soft_sync_negotiated: false,
             udp_migration_allowed: false,
             egfx_on_udp: false,
-            bandwidth_measure_on_udp: false,
             early_tunnel_payloads: VecDeque::new(),
         }
     }
@@ -1985,14 +1981,6 @@ impl RdpServer {
     #[cfg(feature = "__test")]
     pub fn autodetect_mut(&mut self) -> Option<&mut AutoDetectManager> {
         self.autodetect.as_mut()
-    }
-
-    /// Records the outstanding bandwidth measurement as sent on the sideband
-    /// transport, as a bracketed write over it does, for the integration
-    /// testsuite behind the private `__test` feature. Not a stable API.
-    #[cfg(feature = "__test")]
-    pub fn mark_bandwidth_measure_on_udp(&mut self) {
-        self.bandwidth_measure_on_udp = true;
     }
 
     /// Enable periodic Server Heartbeat PDUs (MS-RDPBCGR 2.2.16.1).
@@ -3672,7 +3660,6 @@ impl RdpServer {
         let bracketed = start.is_some();
         if let Some(start) = start {
             trace!(len, "Bracketing a UDP graphics write for a bandwidth measurement");
-            self.bandwidth_measure_on_udp = true;
             udp_transport.send_message(autodetect_sub_header(&start)?).await;
         }
         for payload in payloads {
@@ -3710,7 +3697,6 @@ impl RdpServer {
             (self.autodetect.as_mut(), message_channel_id)
             && let Some(start) = ad.begin_bandwidth_measure(data.len(), monotonic_now_ms())
         {
-            self.bandwidth_measure_on_udp = false;
             let start = encode_autodetect_request(start, message_channel_id, user_channel_id)?;
             writer
                 .write_all(&start)
@@ -3767,23 +3753,6 @@ impl RdpServer {
                     warn!(%error, "Failed to decode an auto-detect response from the UDP tunnel, dropping it")
                 }
             }
-        }
-    }
-
-    /// Drops a bandwidth measurement that went out on the sideband transport
-    /// once that transport has closed: Its results can no longer arrive, and
-    /// while it is outstanding no measurement starts on TCP either.
-    #[cfg_attr(feature = "__test", visibility::make(pub))]
-    fn cancel_udp_bandwidth_measure(&mut self) {
-        if !core::mem::take(&mut self.bandwidth_measure_on_udp) {
-            return;
-        }
-        if self
-            .autodetect
-            .as_mut()
-            .is_some_and(AutoDetectManager::cancel_bandwidth_measure)
-        {
-            debug!("UDP transport closed with a bandwidth measurement outstanding, dropping it");
         }
     }
 
@@ -4237,7 +4206,6 @@ impl RdpServer {
                     // silently dropping every future EGFX batch instead of
                     // actually falling back to TCP as this log claims.
                     *udp_transport.borrow_mut() = None;
-                    this.lock().await.cancel_udp_bandwidth_measure();
                     return core::future::pending::<ServerResult<RunState>>().await;
                 };
                 let mut this = this.lock().await;
@@ -4885,7 +4853,6 @@ impl RdpServer {
         self.soft_sync_negotiated = false;
         self.udp_migration_allowed = false;
         self.egfx_on_udp = false;
-        self.bandwidth_measure_on_udp = false;
         self.early_tunnel_payloads.clear();
 
         let udp_bind_addr = self
