@@ -4217,15 +4217,15 @@ impl RdpServer {
             };
             loop {
                 let Some(message) = transport.recv().await else {
-                    // Soft-Sync only ever moves channels onto the tunnel
-                    // (MS-RDPEDYC 2.2.5.1 has no TCP tunnel type) and the
-                    // tunnel lives as long as the connection (MS-RDPEMT
-                    // 1.3.3), so a client whose channels were moved has
-                    // nowhere left to read them: mstsc ignores them on TCP
-                    // and gives up tens of seconds later. Ending the
-                    // connection lets it auto-reconnect at once.
+                    // Soft-Sync only moves channels onto a tunnel (MS-RDPEDYC
+                    // 2.2.5.1 has no TCP tunnel type), its request promised
+                    // no more of their data over TCP (SOFT_SYNC_TCP_FLUSHED),
+                    // and the tunnel lasts as long as the connection
+                    // (MS-RDPEMT 1.3.3). A client whose channels moved has
+                    // nowhere left to read them, so end the connection and let
+                    // it reconnect rather than keep a session it cannot draw.
                     if this.lock().await.egfx_on_udp {
-                        warn!("UDP transport lost with EGFX on it; ending the connection so the client reconnects");
+                        warn!("UDP transport lost with EGFX on it, ending the connection");
                         return Err(ServerError::reason(
                             "UDP transport",
                             "lost with dynamic channels moved onto it",
