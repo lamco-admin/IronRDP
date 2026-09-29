@@ -134,6 +134,9 @@ pub struct ConnectionInfo {
     pub keyboard_type: ironrdp_pdu::gcc::KeyboardType,
     /// See [`ironrdp_acceptor::AcceptorResult::ime_file_name`].
     pub ime_file_name: String,
+    /// The client came back with an auto-reconnect cookie the server
+    /// verified, in place of its credentials.
+    pub auto_reconnect: bool,
 }
 
 impl ConnectionInfo {
@@ -146,6 +149,7 @@ impl ConnectionInfo {
             keyboard_layout,
             keyboard_type,
             ime_file_name,
+            auto_reconnect: false,
         }
     }
 }
@@ -820,6 +824,13 @@ pub struct RdpServer {
     /// Tracks whether the current cookie has reached a client. Subsequent
     /// connections and hourly updates replace it with a new random.
     auto_reconnect_sent: bool,
+    /// Issue cookies only when asked (`SetAutoReconnectCookie`), or to a
+    /// client that came back with a verified one; see
+    /// [`Self::set_auto_reconnect_on_request`].
+    auto_reconnect_on_request: bool,
+    /// Whether the current connection has been sent a cookie, which is what
+    /// makes it eligible for the hourly update when cookies are on request.
+    auto_reconnect_issued: bool,
 
     /// Abort handle of the current connection's pending UDP multitransport
     /// accept, if one is running. A client that could not establish the
@@ -1561,6 +1572,8 @@ impl RdpServer {
             auto_reconnect_cookie: None,
             previous_auto_reconnect_cookie: None,
             auto_reconnect_sent: false,
+            auto_reconnect_on_request: false,
+            auto_reconnect_issued: false,
             pending_udp_accept_abort: None,
             soft_sync_negotiated: false,
             udp_migration_allowed: false,
@@ -1623,6 +1636,20 @@ impl RdpServer {
         self.auto_reconnect_sent = false;
     }
 
+    /// Send a cookie only to a connection the embedder vouches for, by
+    /// sending [`ServerEvent::SetAutoReconnectCookie`] (through
+    /// [`Self::auto_reconnect_cookie_handle`]) once it has authenticated the
+    /// user itself, or to a client that returned with a verified cookie.
+    ///
+    /// For embedders that accept a connection before the user has proved
+    /// anything, for instance to draw their own logon screen after a
+    /// credential validator hands off: by default the cookie goes to every
+    /// connection at activation, and such a connection could present it on
+    /// reconnecting and skip that screen.
+    pub fn set_auto_reconnect_on_request(&mut self, on_request: bool) {
+        self.auto_reconnect_on_request = on_request;
+    }
+
     /// Returns a handle for replacing the cookie while [`Self::run`] owns this
     /// server.
     pub fn auto_reconnect_cookie_handle(&self) -> AutoReconnectCookieHandle {
@@ -1676,6 +1703,18 @@ impl RdpServer {
         } else {
             Some(cookie.clone())
         }
+    }
+
+    /// Whether a connection gets a cookie at activation: always by default;
+    /// on request, only when it came back with a verified one.
+    fn issues_auto_reconnect_at_activation(&self, is_auto_reconnect: bool) -> bool {
+        !self.auto_reconnect_on_request || is_auto_reconnect
+    }
+
+    /// Whether the hourly update may go to the current connection: on
+    /// request, only to one that was issued a cookie.
+    fn may_rotate_auto_reconnect_cookie(&self) -> bool {
+        !self.auto_reconnect_on_request || self.auto_reconnect_issued
     }
 
     fn commit_auto_reconnect_rotation(&mut self, cookie: rdp::session_info::ServerAutoReconnect) {
@@ -1762,6 +1801,7 @@ impl RdpServer {
 
         Self::send_auto_reconnect_cookie(cookie.clone(), writer, io_channel_id, user_channel_id).await?;
         self.commit_auto_reconnect_rotation(cookie);
+        self.auto_reconnect_issued = true;
 
         Ok(())
     }
@@ -1772,7 +1812,7 @@ impl RdpServer {
         io_channel_id: u16,
         user_channel_id: u16,
     ) -> ServerResult<()> {
-        if !self.supports_auto_reconnect() {
+        if !self.supports_auto_reconnect() || !self.may_rotate_auto_reconnect_cookie() {
             return Ok(());
         }
 
@@ -1807,6 +1847,7 @@ impl RdpServer {
         Self::send_auto_reconnect_cookie(cookie.clone(), writer, io_channel_id, user_channel_id).await?;
         self.auto_reconnect_cookie = Some(cookie);
         self.previous_auto_reconnect_cookie = None;
+        self.auto_reconnect_issued = true;
         self.auto_reconnect_sent = true;
 
         Ok(())
@@ -4176,6 +4217,20 @@ impl RdpServer {
             };
             loop {
                 let Some(message) = transport.recv().await else {
+                    // Soft-Sync only ever moves channels onto the tunnel
+                    // (MS-RDPEDYC 2.2.5.1 has no TCP tunnel type) and the
+                    // tunnel lives as long as the connection (MS-RDPEMT
+                    // 1.3.3), so a client whose channels were moved has
+                    // nowhere left to read them: mstsc ignores them on TCP
+                    // and gives up tens of seconds later. Ending the
+                    // connection lets it auto-reconnect at once.
+                    if this.lock().await.egfx_on_udp {
+                        warn!("UDP transport lost with EGFX on it; ending the connection so the client reconnects");
+                        return Err(ServerError::reason(
+                            "UDP transport",
+                            "lost with dynamic channels moved onto it",
+                        ));
+                    }
                     debug!("UDP transport closed, continuing TCP-only for the rest of the session");
                     // Without this, `dispatch_egfx_messages` would keep seeing
                     // `Some(dead_handle)` here and stay on the UDP branch,
@@ -4278,6 +4333,7 @@ impl RdpServer {
                 keyboard_layout: result.keyboard_layout,
                 keyboard_type: result.keyboard_type,
                 ime_file_name: result.ime_file_name.clone(),
+                auto_reconnect: is_auto_reconnect,
             });
         }
 
@@ -4435,8 +4491,11 @@ impl RdpServer {
             large_pointer_flags,
         )?;
 
-        self.send_next_auto_reconnect_cookie(writer, result.io_channel_id, result.user_channel_id)
-            .await?;
+        self.auto_reconnect_issued = false;
+        if self.issues_auto_reconnect_at_activation(is_auto_reconnect) {
+            self.send_next_auto_reconnect_cookie(writer, result.io_channel_id, result.user_channel_id)
+                .await?;
+        }
 
         let pending_udp_accept =
             Self::drop_declined_udp_accept(pending_udp_accept, result.multitransport_response_success);
@@ -5704,6 +5763,32 @@ mod preempt_tests {
     /// `self.auto_reconnect_cookie = None` on eviction would have silently
     /// killed the feature server-wide the moment the first eviction ever
     /// happened.
+    /// With cookies on request, a connection that has not proved anything
+    /// (for instance one on the embedder's own logon screen) gets no cookie
+    /// at activation and no hourly update; a verified returning client does.
+    #[test]
+    fn cookies_on_request_go_only_to_vouched_connections() {
+        let mut server = RdpServer::builder()
+            .with_addr((Ipv4Addr::LOCALHOST, 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .with_auto_reconnect_on_request(true)
+            .build();
+
+        assert!(!server.issues_auto_reconnect_at_activation(false));
+        assert!(server.issues_auto_reconnect_at_activation(true));
+        assert!(!server.may_rotate_auto_reconnect_cookie());
+
+        server.auto_reconnect_issued = true;
+        assert!(server.may_rotate_auto_reconnect_cookie());
+
+        server.set_auto_reconnect_on_request(false);
+        server.auto_reconnect_issued = false;
+        assert!(server.issues_auto_reconnect_at_activation(false));
+        assert!(server.may_rotate_auto_reconnect_cookie());
+    }
+
     #[test]
     fn invalidating_the_evicted_peers_cookie_does_not_disable_auto_reconnect() {
         let mut server = RdpServer::builder()
