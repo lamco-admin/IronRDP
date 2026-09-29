@@ -17,6 +17,7 @@ use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::CompressionType as PduCompressionType;
 use ironrdp::pdu::rdp::headers::CompressionFlags;
+use ironrdp::pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp::pdu::{self, gcc};
 use ironrdp::server::{
     self, Acceptor, DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer, RdpServerDisplay,
@@ -1422,6 +1423,162 @@ impl ironrdp::core::Encode for RawDvcPayload {
 }
 
 impl DvcEncode for RawDvcPayload {}
+
+/// By default a connection is sent an auto-reconnect cookie as soon as it is
+/// active.
+#[tokio::test]
+async fn an_auto_reconnect_cookie_is_sent_at_activation_by_default() {
+    let (at_activation, _) = auto_reconnect_session(false).await;
+    assert!(at_activation, "the cookie goes to every connection at activation");
+}
+
+/// On request, a connection gets no cookie at activation, only once the
+/// embedder issues one, for instance after its own logon screen.
+#[tokio::test]
+async fn an_auto_reconnect_cookie_on_request_waits_for_the_embedder() {
+    let (at_activation, after_request) = auto_reconnect_session(true).await;
+    assert!(!at_activation, "no cookie before the embedder asks for one");
+    assert!(after_request, "the cookie the embedder issued reaches the client");
+}
+
+/// Connects a client to a server holding an auto-reconnect cookie, and
+/// reports whether the client received a cookie at activation and whether it
+/// received one after the server was handed a new one.
+async fn auto_reconnect_session(on_request: bool) -> (bool, bool) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+        })
+        .with_auto_reconnect_cookie(Some(ServerAutoReconnect {
+            logon_id: 1,
+            random_bits: [0x5a; 16],
+        }))
+        .with_auto_reconnect_on_request(on_request)
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let ev = server.event_sender().clone();
+    let cookie_handle = server.auto_reconnect_cookie_handle();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server = tokio::task::spawn_local(async move {
+                server.run().await.unwrap();
+            });
+
+            let client = tokio::task::spawn_local(async move {
+                let (tx, rx) = oneshot::channel();
+                ev.send(ServerEvent::GetLocalAddr(tx)).unwrap();
+                let server_addr = rx.await.unwrap().unwrap();
+                let tcp_stream = TcpStream::connect(server_addr).await.expect("TCP connect");
+                let client_addr = tcp_stream.local_addr().expect("local_addr");
+                let mut connector = connector::ClientConnector::new(default_client_config(), client_addr);
+
+                let mut framed = ironrdp_tokio::TokioFramed::new(tcp_stream);
+                let should_upgrade = ironrdp_async::connect_begin(&mut framed, &mut connector)
+                    .await
+                    .expect("begin connection");
+                let (upgraded_stream, tls_cert) = ironrdp_tls::upgrade_with_certificate_validation(
+                    framed.into_inner_no_leftover(),
+                    "localhost",
+                    ironrdp_tls::CertificateValidation::DangerouslyAcceptInvalidCertificate,
+                )
+                .await
+                .expect("TLS upgrade");
+                let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+                let mut framed = ironrdp_tokio::TokioFramed::new(upgraded_stream);
+                let server_public_key =
+                    ironrdp_tls::extract_tls_server_public_key(&tls_cert).expect("extract server public key");
+                let connection_result = ironrdp_async::connect_finalize(
+                    upgraded,
+                    connector,
+                    &mut framed,
+                    &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                    "localhost".into(),
+                    server_public_key.to_owned(),
+                    None,
+                )
+                .await
+                .expect("finalize connection");
+
+                let mut stage = ActiveStageBuilder {
+                    static_channels: connection_result.static_channels,
+                    user_channel_id: connection_result.user_channel_id,
+                    io_channel_id: connection_result.io_channel_id,
+                    message_channel_id: connection_result.message_channel_id,
+                    share_id: connection_result.share_id,
+                    compression_type: connection_result.compression_type,
+                    enable_server_pointer: connection_result.enable_server_pointer,
+                    pointer_software_rendering: connection_result.pointer_software_rendering,
+                }
+                .build();
+                let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
+
+                // Whether a cookie arrives while reading for `window`.
+                let mut cookie_within = async |window: Duration| {
+                    let deadline = Instant::now() + window;
+                    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                        let Ok(read) = tokio::time::timeout(left, framed.read_pdu()).await else {
+                            break;
+                        };
+                        let (action, frame) = read.expect("read PDU");
+                        for output in stage.process(&mut image, action, &frame).expect("stage process") {
+                            match output {
+                                ActiveStageOutput::AutoReconnectCookie(_) => return true,
+                                ActiveStageOutput::ResponseFrame(frame) => {
+                                    framed.write_all(&frame).await.expect("write response frame");
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    false
+                };
+
+                let at_activation = cookie_within(Duration::from_secs(1)).await;
+                cookie_handle
+                    .set(Some(ServerAutoReconnect {
+                        logon_id: 1,
+                        random_bits: [0xa5; 16],
+                    }))
+                    .expect("send the new cookie to the server");
+                let after_request = cookie_within(Duration::from_secs(5)).await;
+
+                for output in stage.graceful_shutdown().expect("shutdown") {
+                    if let ActiveStageOutput::ResponseFrame(frame) = output {
+                        framed.write_all(&frame).await.expect("write frame");
+                    }
+                }
+                while let Ok(pdu) = framed.read_pdu().await {
+                    debug!(?pdu);
+                }
+                ev.send(ServerEvent::Quit("bye".into())).unwrap();
+                (at_activation, after_request)
+            });
+
+            let (server, client) = tokio::join!(server, client);
+            server.expect("server task");
+            client.expect("client task")
+        })
+        .await
+}
 
 pub(super) fn default_client_config() -> connector::Config {
     connector::Config {

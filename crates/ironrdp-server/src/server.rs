@@ -4491,7 +4491,11 @@ impl RdpServer {
             large_pointer_flags,
         )?;
 
-        self.auto_reconnect_issued = false;
+        // Per connection, not per activation: a Deactivation-Reactivation pass
+        // keeps the cookie the connection already holds.
+        if !result.reactivation {
+            self.auto_reconnect_issued = false;
+        }
         if self.issues_auto_reconnect_at_activation(is_auto_reconnect) {
             self.send_next_auto_reconnect_cookie(writer, result.io_channel_id, result.user_channel_id)
                 .await?;
