@@ -2529,6 +2529,7 @@ async fn serve_lets_an_authenticated_newcomer_take_over_connections_without_a_pe
         .with_input_handler(TestInputHandler)
         .with_display_handler(TestDisplay {
             rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: true,
         })
         .build();
     server.set_credentials(Some(server::Credentials {
@@ -2595,6 +2596,7 @@ async fn serve_connection_hands_the_replacement_to_the_embedders_loop() {
         .with_input_handler(TestInputHandler)
         .with_display_handler(TestDisplay {
             rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: true,
         })
         .build();
     server.set_credentials(Some(server::Credentials {
@@ -2732,6 +2734,7 @@ async fn serve_gates_a_preempting_newcomer_with_on_accept() {
         .with_input_handler(TestInputHandler)
         .with_display_handler(TestDisplay {
             rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: true,
         })
         .with_connection_handler(Some(Box::new(RefuseSecond(Arc::clone(&asked)))))
         .with_connection_policy(server::ConnectionPolicy::Preempt)
