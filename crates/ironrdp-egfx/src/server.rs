@@ -101,6 +101,10 @@ const MAX_AVC_QP: u8 = 51;
 /// [2.2.4.4.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/bc54993f-2e3c-4285-b32b-58a4bf4cb02e
 const MAX_AVC_QUALITY: u8 = 100;
 
+/// Bytes a pixel takes in an uncompressed `WireToSurface1` bitmap. Both surface
+/// pixel formats, `XRGB_8888` and `ARGB_8888`, are 32 bits wide.
+const UNCOMPRESSED_BYTES_PER_PIXEL: usize = 4;
+
 /// Pre-encoded ZGFX-wrapped bytes for DVC transmission.
 ///
 /// `Encode::encode()` takes `&self`, but ZGFX wrapping is done in `drain_output()`
@@ -2044,6 +2048,9 @@ impl GraphicsPipelineServer {
     ///
     /// The `bitmap_data` should be in the surface's pixel format (typically XRGB).
     ///
+    /// Always places the bitmap at the surface origin. To send only the part of a
+    /// frame that changed, use [`Self::try_send_uncompressed_region()`].
+    ///
     /// Returns `Some(frame_id)` if queued, `None` if not ready or backpressured.
     pub fn send_uncompressed_frame(
         &mut self,
@@ -2087,6 +2094,72 @@ impl GraphicsPipelineServer {
         self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
 
         Some(frame_id)
+    }
+
+    /// Queue part of a frame as an uncompressed bitmap, with a typed rejection.
+    ///
+    /// Sends `bitmap_data` through `WireToSurface1` with `Codec1Type::Uncompressed`,
+    /// placed at `region` instead of at the surface origin, so a caller that knows
+    /// which part of the screen changed can send only that part. A client that
+    /// decodes no compressed codec otherwise receives the whole frame for every
+    /// update, 8 MB at 1920x1080.
+    ///
+    /// `bitmap_data` holds the rows of `region` in the surface's pixel format, four
+    /// bytes a pixel and no row padding. `region` uses exclusive right and bottom
+    /// bounds, like the wire-format `RDPGFX_RECT16`.
+    ///
+    /// An empty region, a region that doesn't lie inside the surface and a payload
+    /// whose length isn't the region's area are rejected with
+    /// [`FrameSubmissionError::InvalidFrame`], because the client can't place such a
+    /// bitmap.
+    pub fn try_send_uncompressed_region(
+        &mut self,
+        surface_id: u16,
+        bitmap_data: &[u8],
+        region: ExclusiveRectangle,
+        timestamp_ms: u32,
+    ) -> Result<u32, FrameSubmissionError> {
+        if !self.is_ready() {
+            return Err(FrameSubmissionError::NotReady);
+        }
+        if self.should_backpressure() {
+            self.qoe.record_backpressure();
+            return Err(FrameSubmissionError::Backpressured {
+                frames_in_flight: self.frames.in_flight(),
+                max_frames_in_flight: self.frames.max_in_flight(),
+            });
+        }
+
+        let surface = self
+            .surfaces
+            .get(surface_id)
+            .ok_or(FrameSubmissionError::UnknownSurface { surface_id })?;
+        if !Self::rect_fits_surface(surface, &region) {
+            return Err(FrameSubmissionError::InvalidFrame);
+        }
+
+        // INVARIANT: `rect_fits_surface` established that both extents are positive.
+        let area = usize::from(region.right - region.left) * usize::from(region.bottom - region.top);
+        if area.checked_mul(UNCOMPRESSED_BYTES_PER_PIXEL) != Some(bitmap_data.len()) {
+            return Err(FrameSubmissionError::InvalidFrame);
+        }
+
+        let pixel_format = surface.pixel_format;
+        let timestamp = Self::make_timestamp(timestamp_ms);
+        let frame_id = self.frames.begin_frame(timestamp);
+
+        self.output_queue
+            .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
+        self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id,
+            codec_id: Codec1Type::Uncompressed,
+            pixel_format,
+            destination_rectangle: region,
+            bitmap_data: bitmap_data.to_vec(),
+        }));
+        self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
+
+        Ok(frame_id)
     }
 
     /// Queue a RemoteFX Progressive frame for transmission.
