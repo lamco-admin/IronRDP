@@ -1650,16 +1650,20 @@ impl GraphicsPipelineServer {
         rect.left < rect.right && rect.top < rect.bottom && rect.right <= surface.width && rect.bottom <= surface.height
     }
 
-    fn submission_state(&self, surface_id: u16, avc444: bool) -> Result<&Surface, FrameSubmissionError> {
+    /// Readiness, codec support, backpressure and surface lookup, in that order.
+    ///
+    /// `require_codec` runs after the readiness check and before the backpressure
+    /// check, so a sender that needs a codec capability reports it ahead of
+    /// backpressure, and a sender that needs none passes a check that always succeeds.
+    fn surface_for_submission(
+        &self,
+        surface_id: u16,
+        require_codec: impl FnOnce(&Self) -> Result<(), FrameSubmissionError>,
+    ) -> Result<&Surface, FrameSubmissionError> {
         if !self.is_ready() {
             return Err(FrameSubmissionError::NotReady);
         }
-        if avc444 && !self.supports_avc444() {
-            return Err(FrameSubmissionError::Avc444Unsupported);
-        }
-        if !avc444 && !self.supports_avc420() {
-            return Err(FrameSubmissionError::Avc420Unsupported);
-        }
+        require_codec(self)?;
         if self.should_backpressure() {
             return Err(FrameSubmissionError::Backpressured {
                 frames_in_flight: self.frames.in_flight(),
@@ -1671,6 +1675,29 @@ impl GraphicsPipelineServer {
             .ok_or(FrameSubmissionError::UnknownSurface { surface_id })
     }
 
+    fn submission_state(&self, surface_id: u16, avc444: bool) -> Result<&Surface, FrameSubmissionError> {
+        self.surface_for_submission(surface_id, |server| {
+            if avc444 && !server.supports_avc444() {
+                Err(FrameSubmissionError::Avc444Unsupported)
+            } else if !avc444 && !server.supports_avc420() {
+                Err(FrameSubmissionError::Avc420Unsupported)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// Count a backpressure rejection in the QoE record and pass the result through.
+    fn record_if_backpressured(
+        &mut self,
+        result: Result<Surface, FrameSubmissionError>,
+    ) -> Result<Surface, FrameSubmissionError> {
+        if matches!(result, Err(FrameSubmissionError::Backpressured { .. })) {
+            self.qoe.record_backpressure();
+        }
+        result
+    }
+
     /// Inspect AVC420 readiness without queueing a frame.
     pub fn avc420_submission_state(&self, surface_id: u16) -> Result<(), FrameSubmissionError> {
         self.submission_state(surface_id, false).map(|_| ())
@@ -1678,13 +1705,8 @@ impl GraphicsPipelineServer {
 
     fn prepare_submission(&mut self, surface_id: u16, avc444: bool) -> Result<Surface, FrameSubmissionError> {
         // Copy the small descriptor so validation and QoE accounting use one lookup.
-        match self.submission_state(surface_id, avc444).cloned() {
-            Err(error @ FrameSubmissionError::Backpressured { .. }) => {
-                self.qoe.record_backpressure();
-                Err(error)
-            }
-            result => result,
-        }
+        let result = self.submission_state(surface_id, avc444).cloned();
+        self.record_if_backpressured(result)
     }
 
     /// Queue an H.264 AVC420 frame for transmission with a typed rejection.
@@ -2112,6 +2134,12 @@ impl GraphicsPipelineServer {
     /// whose length isn't the region's area are rejected with
     /// [`FrameSubmissionError::InvalidFrame`], because the client can't place such a
     /// bitmap.
+    ///
+    /// The payload still goes through the ZGFX stage of [`Self::drain_output()`]. With
+    /// the default [`CompressionMode::Never`] it is sent as is. With `Auto` or
+    /// `Always` the compressor runs over the whole payload before the single-segment
+    /// size check, so the CPU cost grows with the area of `region`. Keep compression
+    /// off, or send small regions, where that cost matters.
     pub fn try_send_uncompressed_region(
         &mut self,
         surface_id: u16,
@@ -2119,22 +2147,11 @@ impl GraphicsPipelineServer {
         region: ExclusiveRectangle,
         timestamp_ms: u32,
     ) -> Result<u32, FrameSubmissionError> {
-        if !self.is_ready() {
-            return Err(FrameSubmissionError::NotReady);
-        }
-        if self.should_backpressure() {
-            self.qoe.record_backpressure();
-            return Err(FrameSubmissionError::Backpressured {
-                frames_in_flight: self.frames.in_flight(),
-                max_frames_in_flight: self.frames.max_in_flight(),
-            });
-        }
-
-        let surface = self
-            .surfaces
-            .get(surface_id)
-            .ok_or(FrameSubmissionError::UnknownSurface { surface_id })?;
-        if !Self::rect_fits_surface(surface, &region) {
+        // No codec capability is required: the point of this sender is a client that
+        // decodes no compressed codec.
+        let result = self.surface_for_submission(surface_id, |_| Ok(())).cloned();
+        let surface = self.record_if_backpressured(result)?;
+        if !Self::rect_fits_surface(&surface, &region) {
             return Err(FrameSubmissionError::InvalidFrame);
         }
 
