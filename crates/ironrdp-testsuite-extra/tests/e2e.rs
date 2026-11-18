@@ -277,6 +277,114 @@ async fn test_client_server_advertising_dyn_vc_gfx_protocol() {
     .await
 }
 
+/// A server with a graphics pipeline factory advertises the pipeline in its RDP Negotiation Response, also to a
+/// connection that negotiates while a session is live.
+///
+/// [MS-RDPBCGR] 2.2.1.2.1 RDP Negotiation Response (RDP_NEG_RSP): `DYNVC_GFX_PROTOCOL_SUPPORTED` means the server
+/// supports the Graphics Pipeline Extension.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b2975bdc-6d56-49ee-9c57-f2ff3a0b6817
+// oracle: spec MS-RDPBCGR §2.2.1.2.1 (the server supports the Graphics Pipeline Extension)
+// oracle: reference FreeRDP/FreeRDP@65c0333c8191:libfreerdp/core/nego.c (set when the server supports the pipeline)
+#[tokio::test]
+async fn a_server_with_a_graphics_pipeline_advertises_it_when_negotiating() {
+    let (idle, during_a_session) = negotiation_response_flags_idle_and_during_a_session(true).await;
+    assert!(idle.contains(pdu::nego::ResponseFlags::DYNVC_GFX_PROTOCOL_SUPPORTED));
+    assert!(during_a_session.contains(pdu::nego::ResponseFlags::DYNVC_GFX_PROTOCOL_SUPPORTED));
+}
+
+/// A server without a graphics pipeline factory doesn't claim to support the pipeline.
+// oracle: spec MS-RDPBCGR §2.2.1.2.1 (the flag claims support for the Graphics Pipeline Extension)
+#[tokio::test]
+async fn a_server_without_a_graphics_pipeline_does_not_advertise_one() {
+    let (idle, during_a_session) = negotiation_response_flags_idle_and_during_a_session(false).await;
+    assert!(!idle.contains(pdu::nego::ResponseFlags::DYNVC_GFX_PROTOCOL_SUPPORTED));
+    assert!(!during_a_session.contains(pdu::nego::ResponseFlags::DYNVC_GFX_PROTOCOL_SUPPORTED));
+}
+
+/// The flags of the RDP Negotiation Response a `Preempt` server sends to a connection while it's idle, and to one that
+/// arrives during a session and so negotiates alongside it.
+async fn negotiation_response_flags_idle_and_during_a_session(
+    with_graphics_pipeline: bool,
+) -> (pdu::nego::ResponseFlags, pdu::nego::ResponseFlags) {
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let (caps_tx, _caps_rx) = mpsc::unbounded_channel();
+    let gfx_factory: Option<Box<dyn GfxServerFactory>> = if with_graphics_pipeline {
+        Some(Box::new(TestGfxFactory { caps_tx }))
+    } else {
+        None
+    };
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: false,
+        })
+        .with_gfx_factory(gfx_factory)
+        .with_connection_policy(server::ConnectionPolicy::Preempt)
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let ev = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    let test = Box::pin(local.run_until(async move {
+        let server_task = tokio::task::spawn_local(async move {
+            let _ = server.run().await;
+        });
+        let server_addr = local_addr_of(&ev).await;
+
+        let idle = negotiation_response_flags(server_addr).await;
+        let (session, _) = connect_client(server_addr, |client_addr| {
+            connector::ClientConnector::new(default_client_config(), client_addr)
+        })
+        .await;
+        let during_a_session = negotiation_response_flags(server_addr).await;
+
+        drop(session);
+        server_task.abort();
+        (idle, during_a_session)
+    }));
+    tokio::time::timeout(Duration::from_secs(20), test)
+        .await
+        .expect("both negotiations must finish")
+}
+
+/// Send `server_addr` a Connection Request for TLS and return the flags of the RDP Negotiation Response.
+async fn negotiation_response_flags(server_addr: SocketAddr) -> pdu::nego::ResponseFlags {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = TcpStream::connect(server_addr).await.expect("connect to the server");
+    let request = pdu::nego::ConnectionRequest {
+        nego_data: None,
+        flags: pdu::nego::RequestFlags::empty(),
+        protocol: pdu::nego::SecurityProtocol::SSL,
+        correlation_info: None,
+    };
+    let request = encode_vec(&X224(request)).expect("encode connection request");
+    stream.write_all(&request).await.expect("send connection request");
+    let mut confirm = [0u8; 128];
+    let read = stream.read(&mut confirm).await.expect("read connection confirm");
+    let confirm = decode::<X224<pdu::nego::ConnectionConfirm>>(&confirm[..read])
+        .expect("decode connection confirm")
+        .0;
+    let response = match confirm {
+        pdu::nego::ConnectionConfirm::Response { flags, .. } => Ok(flags),
+        pdu::nego::ConnectionConfirm::Failure { code } => Err(code),
+    };
+    response.expect("the server must accept the negotiation")
+}
+
 /// The server sizes fast-path updates by the client's Multifragment Update Capability Set.
 ///
 /// [MS-RDPBCGR] 2.2.7.2.6: MaxRequestSize is the size of the client's reassembly buffer, so no
@@ -1246,6 +1354,23 @@ async fn display_control_channel_is_not_created_when_the_display_declines_it() {
     );
 }
 
+/// Serves the client until the echo channel has opened and the connection then goes quiet, for at most 5 seconds.
+///
+/// The server sends the Create request for every dynamic channel together, in its reply to the client's capabilities,
+/// so once the echo channel has opened and the connection goes quiet, every one of them has been processed.
+async fn serve_until_dynamic_channels_settle(
+    stage: &mut ActiveStage,
+    framed: &mut Framed<TokioStream<TlsStream<TcpStream>>>,
+    image: &mut DecodedImage,
+    echo_started: &AtomicBool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut settled = false;
+    while !settled && Instant::now() < deadline {
+        settled = !serve_one_pdu(stage, framed, image).await && echo_started.load(Ordering::Relaxed);
+    }
+}
+
 /// Connects a real client that registers a Display Control channel and an
 /// echo channel, and reports whether each was created by the server.
 ///
@@ -1285,12 +1410,7 @@ async fn run_display_control_probe(offers_display_control: bool) -> (bool, bool)
             let _display_tx = display_tx;
             let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
 
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut settled = false;
-            while !settled && Instant::now() < deadline {
-                settled =
-                    !serve_one_pdu(&mut stage, &mut framed, &mut image).await && observed_echo.load(Ordering::Relaxed);
-            }
+            serve_until_dynamic_channels_settle(&mut stage, &mut framed, &mut image, &observed_echo).await;
 
             (stage, framed)
         },
@@ -1301,6 +1421,262 @@ async fn run_display_control_probe(offers_display_control: bool) -> (bool, bool)
         echo_started.load(Ordering::Relaxed),
         display_control_started.load(Ordering::Relaxed),
     )
+}
+
+/// A client that sets RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL gets the graphics pipeline channel, and the display gets the
+/// connection's EGFX server.
+/// This shows the probe sees the channel at all, which the test below relies on to mean anything.
+// oracle: mutant the graphics pipeline held back from a client that advertises it, or its server kept from the display
+#[tokio::test]
+async fn egfx_channel_is_created_for_a_client_that_advertises_it() {
+    let probe = run_egfx_probe(true, EgfxRegistration::GfxFactory, false).await;
+
+    probe.assert_settled();
+    assert!(
+        probe.egfx_started,
+        "a client that advertises the graphics pipeline must get the channel created"
+    );
+    assert!(
+        probe.egfx_servers.contains(&true),
+        "the display must get the EGFX server of a client that advertises the graphics pipeline"
+    );
+}
+
+/// A client implementing the graphics pipeline sets RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL in the earlyCapabilityFlags of
+/// its Client Core Data to indicate support, per MS-RDPEGFX [1.5.1] Client Implementation Requirements, so a client
+/// that leaves it clear isn't offered the channel, even with an EGFX factory configured and an EGFX listener on the
+/// client.
+///
+/// [1.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/f75a7d5c-141d-4bbc-8b27-3299378f8ac6
+// oracle: mutant a server that offers the graphics pipeline to a client that didn't advertise it
+#[tokio::test]
+async fn egfx_channel_is_not_created_for_a_client_that_does_not_advertise_it() {
+    let probe = run_egfx_probe(false, EgfxRegistration::GfxFactory, false).await;
+
+    probe.assert_settled();
+    assert!(
+        !probe.egfx_started,
+        "a client that didn't advertise the graphics pipeline must not get the channel created"
+    );
+    // oracle: mutant handing the display an EGFX server whose channel is never offered
+    assert!(
+        !probe.egfx_servers.contains(&true),
+        "the display must not get an EGFX server for a client that didn't advertise the graphics pipeline"
+    );
+}
+
+/// A client that sets RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL gets a GraphicsPipelineServer added as a plain dynamic
+/// channel, through a dynamic channel factory and with no EGFX factory.
+/// This shows the probe sees a channel registered this way at all, which the test below relies on to mean anything.
+// oracle: mutant the graphics pipeline held back from a client that advertises it when no EGFX factory registered it
+#[tokio::test]
+async fn egfx_registered_as_a_dynamic_channel_is_created_for_a_client_that_advertises_it() {
+    let probe = run_egfx_probe(true, EgfxRegistration::DynamicChannel, false).await;
+
+    probe.assert_settled();
+    assert!(
+        probe.egfx_started,
+        "a client that advertises the graphics pipeline must get the dynamically registered channel"
+    );
+}
+
+/// The flag decides the channel whether an EGFX factory registered it or a dynamic channel factory added a
+/// GraphicsPipelineServer directly, so the latter isn't offered to a client that leaves
+/// RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL clear either.
+/// MS-RDPEGFX [1.5.1] Client Implementation Requirements makes the flag the client's signal of support.
+///
+/// [1.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/f75a7d5c-141d-4bbc-8b27-3299378f8ac6
+// oracle: mutant a server that offers the graphics pipeline to a client that didn't advertise it
+// oracle: mutant a graphics pipeline check that only finds the channel an EGFX factory registers
+#[tokio::test]
+async fn egfx_registered_as_a_dynamic_channel_is_not_created_for_a_client_that_does_not_advertise_it() {
+    let probe = run_egfx_probe(false, EgfxRegistration::DynamicChannel, false).await;
+
+    probe.assert_settled();
+    assert!(
+        !probe.egfx_started,
+        "a client that didn't advertise the graphics pipeline must not get the dynamically registered channel"
+    );
+}
+
+/// A client that sets RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL keeps its graphics pipeline when the server reactivates it.
+/// A Deactivation-Reactivation Sequence (MS-RDPBCGR 1.3.1.3) doesn't repeat the Basic Settings Exchange that carried
+/// the flag, so the display gets the connection's EGFX server again after one.
+// oracle: mutant a server that drops the graphics pipeline when it reactivates a client that advertised it
+#[tokio::test]
+async fn egfx_server_is_kept_across_a_reactivation() {
+    let probe = run_egfx_probe(true, EgfxRegistration::GfxFactory, true).await;
+
+    let egfx_servers = &probe.egfx_servers;
+    assert!(
+        2 <= egfx_servers.len() && egfx_servers.first() == Some(&true) && egfx_servers.last() == Some(&true),
+        "the display must get the EGFX server at activation and again after the reactivation, got {egfx_servers:?}"
+    );
+}
+
+/// How the server under test registers the graphics pipeline.
+enum EgfxRegistration {
+    /// Through an EGFX factory, which also hands the display the connection's EGFX server.
+    GfxFactory,
+    /// As a plain dynamic channel, through a dynamic channel factory.
+    DynamicChannel,
+}
+
+/// Adds a GraphicsPipelineServer to each connection's dynamic channels.
+struct DynamicEgfxChannel;
+
+impl server::DynamicChannelFactory for DynamicEgfxChannel {
+    fn attach(&self, channels: ironrdp_dvc::DrdynvcServer) -> ironrdp_dvc::DrdynvcServer {
+        channels.with_dynamic_channel(ironrdp_egfx::server::GraphicsPipelineServer::new(Box::new(
+            TestGfxHandler {
+                caps_tx: mpsc::unbounded_channel().0,
+            },
+        )))
+    }
+}
+
+/// What one connection showed of the graphics pipeline.
+struct EgfxProbe {
+    echo_started: bool,
+    egfx_started: bool,
+    /// Whether the display was handed an EGFX server, each time the server asked it for updates.
+    egfx_servers: Vec<bool>,
+}
+
+impl EgfxProbe {
+    /// Asserts the server created a dynamic channel at all, so the probe's other answers mean something.
+    fn assert_settled(&self) {
+        // oracle: mutant a server that creates no dynamic channel, which would let the negative tests pass on nothing
+        assert!(
+            self.echo_started,
+            "the echo channel must open for the probe to mean anything"
+        );
+    }
+}
+
+/// Connects a real client that registers an EGFX channel and an echo channel, with `support_dyn_vc_gfx_protocol` as
+/// given, to a server that registers the graphics pipeline as `registration` says, and reports what the server created.
+///
+/// The server asks the display for updates before any dynamic channel exists, so both answers are final once the
+/// dynamic channels have settled.
+/// With `reactivate`, the probe then resizes the display, which makes the server deactivate and reactivate the session,
+/// and serves the client for at most 5 seconds until the server asks the display for updates again.
+async fn run_egfx_probe(
+    support_dyn_vc_gfx_protocol: bool,
+    registration: EgfxRegistration,
+    reactivate: bool,
+) -> EgfxProbe {
+    let echo_started = Arc::new(AtomicBool::new(false));
+    let egfx_started = Arc::new(AtomicBool::new(false));
+    let egfx_servers = Arc::new(StdMutex::new(Vec::new()));
+
+    let connector_echo = Arc::clone(&echo_started);
+    let connector_egfx = Arc::clone(&egfx_started);
+    let observed_echo = Arc::clone(&echo_started);
+    let display_egfx_servers = Arc::clone(&egfx_servers);
+    let observed_egfx_servers = Arc::clone(&egfx_servers);
+
+    client_server_with_display(
+        move |rx| EgfxServerRecorder {
+            display: TestDisplay {
+                rx,
+                offers_display_control: true,
+            },
+            egfx_servers: display_egfx_servers,
+        },
+        None,
+        connector::Config {
+            support_dyn_vc_gfx_protocol,
+            ..default_client_config()
+        },
+        Vec::new(),
+        match registration {
+            EgfxRegistration::GfxFactory => TestServerOptions {
+                gfx_factory: Some(Box::new(TestGfxFactory {
+                    caps_tx: mpsc::unbounded_channel().0,
+                })),
+                ..Default::default()
+            },
+            EgfxRegistration::DynamicChannel => TestServerOptions {
+                dynamic_channel_factory: Some(Box::new(DynamicEgfxChannel)),
+                ..Default::default()
+            },
+        },
+        move |connector| {
+            connector.with_static_channel(
+                DrdynvcClient::new()
+                    .with_dynamic_channel(StartRecorder::new(ironrdp_egfx::CHANNEL_NAME, connector_egfx))
+                    .with_dynamic_channel(StartRecorder::new(ironrdp::echo::CHANNEL_NAME, connector_echo)),
+            )
+        },
+        move |mut stage, activation_factory, mut framed, display_tx, _echo_handle| async move {
+            let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
+
+            serve_until_dynamic_channels_settle(&mut stage, &mut framed, &mut image, &observed_echo).await;
+
+            if reactivate {
+                display_tx
+                    .send(DisplayUpdate::Resize(DesktopSize {
+                        width: 2048,
+                        height: 2048,
+                    }))
+                    .unwrap();
+                'deactivated: loop {
+                    let (action, frame) = tokio::time::timeout(Duration::from_secs(10), framed.read_pdu())
+                        .await
+                        .expect("the server deactivated the session")
+                        .expect("read PDU");
+                    for output in stage.process(&mut image, action, &frame, None).expect("stage process") {
+                        match output {
+                            ActiveStageOutput::ResponseFrame(frame) => {
+                                framed.write_all(&frame).await.expect("write response frame");
+                            }
+                            ActiveStageOutput::DeactivateAll => break 'deactivated,
+                            _ => {}
+                        }
+                    }
+                }
+                run_reactivation(&mut stage, &activation_factory, &mut framed).await;
+
+                let mut image = DecodedImage::new(PixelFormat::RgbA32, 2048, 2048);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while observed_egfx_servers.lock().unwrap().len() < 2 && Instant::now() < deadline {
+                    serve_one_pdu(&mut stage, &mut framed, &mut image).await;
+                }
+            }
+
+            (stage, framed)
+        },
+    )
+    .await;
+
+    EgfxProbe {
+        echo_started: echo_started.load(Ordering::Relaxed),
+        egfx_started: egfx_started.load(Ordering::Relaxed),
+        egfx_servers: egfx_servers.lock().unwrap().clone(),
+    }
+}
+
+/// Test display that records, each time the server asks it for updates, whether it was handed an EGFX server.
+struct EgfxServerRecorder {
+    display: TestDisplay,
+    egfx_servers: Arc<StdMutex<Vec<bool>>>,
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for EgfxServerRecorder {
+    async fn size(&mut self) -> DesktopSize {
+        self.display.size().await
+    }
+
+    async fn updates(&mut self, ctx: DisplayContext) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        self.egfx_servers.lock().unwrap().push(ctx.gfx_handle.is_some());
+        self.display.updates(ctx).await
+    }
+
+    async fn offers_display_control(&mut self) -> bool {
+        self.display.offers_display_control().await
+    }
 }
 
 /// A client that sets neither INFO_NOAUDIOPLAYBACK nor INFO_REMOTECONSOLEAUDIO gets its audio redirected, per
@@ -2376,6 +2752,8 @@ struct TestServerOptions {
     max_static_channel_message_size: Option<usize>,
     max_dynamic_channel_message_size: Option<usize>,
     connection_handler: Option<Box<dyn server::ConnectionHandler>>,
+    gfx_factory: Option<Box<dyn GfxServerFactory>>,
+    dynamic_channel_factory: Option<Box<dyn server::DynamicChannelFactory>>,
 }
 
 async fn client_server_with_display<D, DF, F, Fut, C>(
@@ -2429,6 +2807,10 @@ async fn client_server_with_display<D, DF, F, Fut, C>(
         server_builder = server_builder.with_max_dynamic_channel_message_size(max_message_size);
     }
     server_builder = server_builder.with_connection_handler(server_options.connection_handler);
+    server_builder = server_builder.with_gfx_factory(server_options.gfx_factory);
+    if let Some(factory) = server_options.dynamic_channel_factory {
+        server_builder = server_builder.with_dynamic_channel_factory(factory);
+    }
     let mut server = server_builder.build();
     server.set_credentials(Some(server::Credentials {
         username: USERNAME.into(),
@@ -3241,7 +3623,21 @@ where
     Fut: Future<Output = T>,
     T: 'static,
 {
-    let (mut server, display_tx) = auto_reconnect_server(on_request);
+    let (server, display_tx) = auto_reconnect_server(on_request);
+    run_auto_reconnect_server(server, display_tx, client).await
+}
+
+/// Runs `client` against `server`, as [`with_auto_reconnect_server`] does, for a server the caller has configured.
+async fn run_auto_reconnect_server<F, Fut, T>(
+    mut server: RdpServer,
+    display_tx: UnboundedSender<DisplayUpdate>,
+    client: F,
+) -> T
+where
+    F: FnOnce(SocketAddr, server::AutoReconnectCookieHandle, UnboundedSender<DisplayUpdate>) -> Fut + 'static,
+    Fut: Future<Output = T>,
+    T: 'static,
+{
     let ev = server.event_sender().clone();
     let cookie_handle = server.auto_reconnect_cookie_handle();
 
@@ -3252,17 +3648,21 @@ where
                 server.run().await.unwrap();
             });
 
-            let client = tokio::task::spawn_local(async move {
-                let (tx, rx) = oneshot::channel();
-                ev.send(ServerEvent::GetLocalAddr(tx)).unwrap();
-                let server_addr = rx.await.unwrap().unwrap();
-                let result = client(server_addr, cookie_handle, display_tx).await;
-                ev.send(ServerEvent::Quit("bye".into())).unwrap();
-                result
+            let client = tokio::task::spawn_local({
+                let ev = ev.clone();
+                async move {
+                    let (tx, rx) = oneshot::channel();
+                    ev.send(ServerEvent::GetLocalAddr(tx)).unwrap();
+                    let server_addr = rx.await.unwrap().unwrap();
+                    client(server_addr, cookie_handle, display_tx).await
+                }
             });
 
-            let (server, client) = tokio::join!(server, client);
-            server.expect("server task");
+            // Stop the server once the client is done, also when it panicked, so a failing assertion fails the test
+            // instead of leaving it waiting on the server.
+            let client = client.await;
+            let _ = ev.send(ServerEvent::Quit("bye".into()));
+            server.await.expect("server task");
             client.expect("client task")
         })
         .await
@@ -3279,8 +3679,17 @@ struct CookieProbe {
 impl CookieProbe {
     /// Connects to `server_addr`, presenting `cookie` as an auto-reconnect cookie if given.
     async fn connect(server_addr: SocketAddr, cookie: Option<ServerAutoReconnect>) -> Self {
-        let (stage, activation_factory, framed) =
-            connect_active_client(server_addr, default_client_config(), cookie).await;
+        Self::connect_with(server_addr, default_client_config(), cookie).await
+    }
+
+    /// Connects to `server_addr` as [`Self::connect`] does, with `client_config` instead of the default client
+    /// configuration.
+    async fn connect_with(
+        server_addr: SocketAddr,
+        client_config: connector::Config,
+        cookie: Option<ServerAutoReconnect>,
+    ) -> Self {
+        let (stage, activation_factory, framed) = connect_active_client(server_addr, client_config, cookie).await;
 
         Self {
             stage,
@@ -3354,8 +3763,10 @@ impl CookieProbe {
         }
     }
 
-    /// Whether the server accepts the cookie this client presented. An accepted cookie is
-    /// answered with a fresh one at activation; a rejected cookie ends the connection.
+    /// Whether the server accepts the cookie this client presented.
+    /// An accepted cookie is answered with a fresh one at activation.
+    /// A cookie that doesn't verify is a normal logon, which on request gets no cookie until the embedder vouches for
+    /// it.
     async fn cookie_accepted(&mut self, window: Duration) -> bool {
         self.watch_for_cookie(window).await.unwrap_or(false)
     }
@@ -3406,7 +3817,7 @@ async fn an_auto_reconnect_cookie_the_embedder_issues_invalidates_the_previous_o
         random_bits: [0x22; 16],
     };
 
-    let (first_still_works, second_works) = with_auto_reconnect_server(true, {
+    let (first_cookie, second_works) = with_auto_reconnect_server(true, {
         let (first, second) = (first.clone(), second.clone());
         async move |server_addr, cookie_handle, _display_tx| {
             // The embedder vouches for one connection, then for another.
@@ -3424,22 +3835,234 @@ async fn an_auto_reconnect_cookie_the_embedder_issues_invalidates_the_previous_o
                 probe.disconnect().await;
             }
 
-            // A verified cookie is sent another one at activation; a rejected one ends the connection.
+            // A verified cookie is sent another one at activation.
+            // One that doesn't verify logs on normally, and on request that connection gets no cookie.
             let mut with_first = CookieProbe::connect(server_addr, Some(first)).await;
-            let first_still_works = with_first.cookie_accepted(Duration::from_secs(1)).await;
+            let first_cookie = with_first.watch_for_cookie(Duration::from_secs(1)).await;
             drop(with_first);
 
             let mut with_second = CookieProbe::connect(server_addr, Some(second)).await;
             let second_works = with_second.cookie_accepted(Duration::from_secs(1)).await;
             with_second.disconnect().await;
 
-            (first_still_works, second_works)
+            (first_cookie, second_works)
         }
     })
     .await;
 
-    assert!(!first_still_works, "the earlier client's cookie is no longer accepted");
+    // oracle: spec MS-RDPBCGR §3.3.5.3.11 (a cookie that fails falls back to a normal logon)
+    // oracle: mutant the fallback reported to the embedder as auto-reconnected
+    assert_eq!(
+        first_cookie,
+        Ok(false),
+        "the earlier client's cookie is no longer accepted, so it logs on normally and gets no cookie"
+    );
     assert!(second_works, "the newest cookie is accepted");
+}
+
+/// A cookie the test server never issued, as one issued before a server restarted.
+fn stale_auto_reconnect_cookie() -> ServerAutoReconnect {
+    ServerAutoReconnect {
+        logon_id: 1,
+        random_bits: [0x77; 16],
+    }
+}
+
+/// A client that comes back with a cookie the server can't verify, such as one issued before the server restarted, logs
+/// on with its credentials instead, and is sent a fresh cookie at activation like any other connection.
+///
+/// MS-RDPBCGR [3.3.5.3.11] Processing Client Info PDU: "If logon with the cookie fails, the credentials supplied in the
+/// Client Info PDU SHOULD be used".
+///
+/// [3.3.5.3.11]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/ef9db6a5-36f4-4613-84b3-97501679d210
+// oracle: spec MS-RDPBCGR §3.3.5.3.11
+#[tokio::test]
+async fn an_unverifiable_auto_reconnect_cookie_falls_back_to_a_normal_logon() {
+    let admitted = with_auto_reconnect_server(false, async |server_addr, _cookie_handle, _display_tx| {
+        let mut probe = CookieProbe::connect(server_addr, Some(stale_auto_reconnect_cookie())).await;
+        let admitted = probe.cookie_within(Duration::from_secs(5)).await;
+        probe.disconnect().await;
+        admitted
+    })
+    .await;
+
+    assert!(admitted, "the client logs on and receives a fresh cookie");
+}
+
+/// With a credential validator, a client whose cookie fails logs on when the validator accepts its Client Info
+/// credentials.
+/// MS-RDPBCGR [3.3.5.3.11] Processing Client Info PDU says the server SHOULD use them when the cookie fails.
+///
+/// [3.3.5.3.11]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/ef9db6a5-36f4-4613-84b3-97501679d210
+// oracle: spec MS-RDPBCGR §3.3.5.3.11
+#[tokio::test]
+async fn an_unverifiable_auto_reconnect_cookie_logs_on_with_credentials_the_validator_accepts() {
+    let (mut server, display_tx) = auto_reconnect_server(false);
+    server.set_credential_validator(Some(Arc::new(server::ExactMatchCredentialValidator::new(
+        server::Credentials {
+            username: USERNAME.into(),
+            password: PASSWORD.into(),
+            domain: None,
+        },
+    ))));
+
+    let admitted = run_auto_reconnect_server(server, display_tx, async |server_addr, _cookie_handle, _display_tx| {
+        let mut probe = CookieProbe::connect(server_addr, Some(stale_auto_reconnect_cookie())).await;
+        let admitted = probe.cookie_within(Duration::from_secs(5)).await;
+        probe.disconnect().await;
+        admitted
+    })
+    .await;
+
+    assert!(admitted, "the validator accepts the credentials, so the client logs on");
+}
+
+/// The same under NLA: CredSSP with HYBRID_EX runs the credential validator on the delegated credentials before the
+/// cookie is read, and a cookie that then fails doesn't run it again.
+/// The client still logs on, as MS-RDPBCGR [3.3.5.3.11] Processing Client Info PDU asks when the cookie fails.
+///
+/// [3.3.5.3.11]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/ef9db6a5-36f4-4613-84b3-97501679d210
+#[tokio::test]
+async fn an_unverifiable_auto_reconnect_cookie_logs_on_after_nla() {
+    let (mut server, display_tx) = hybrid_server();
+    server.set_auto_reconnect_cookie(Some(ServerAutoReconnect {
+        logon_id: 1,
+        random_bits: [0x5a; 16],
+    }));
+    let calls = Arc::new(StdMutex::new(Vec::new()));
+    server.set_credential_validator(Some(Arc::new(RecordingCredentialValidator(Arc::clone(&calls)))));
+
+    let admitted = run_auto_reconnect_server(server, display_tx, async |server_addr, _cookie_handle, _display_tx| {
+        let mut probe =
+            CookieProbe::connect_with(server_addr, hybrid_client_config(), Some(stale_auto_reconnect_cookie())).await;
+        let admitted = probe.cookie_within(Duration::from_secs(5)).await;
+        probe.disconnect().await;
+        admitted
+    })
+    .await;
+
+    // oracle: spec MS-RDPBCGR §3.3.5.3.11
+    assert!(admitted, "the client logs on after NLA and receives a fresh cookie");
+    // oracle: mutant the fallback running the validator again after HYBRID_EX
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [(HYBRID_USER.to_owned(), Some(server::CredentialOrigin::CredSspDelegated))],
+        "the validator runs once, during CredSSP"
+    );
+}
+
+/// A credential validator that accepts every call and records the user name, with the origin when the server passes one
+/// through [`validate_received`].
+///
+/// [`validate_received`]: server::CredentialValidator::validate_received
+struct RecordingCredentialValidator(ValidatorCalls);
+
+/// Each call a [`RecordingCredentialValidator`] saw, as the user name and the origin when the server passed one.
+type ValidatorCalls = Arc<StdMutex<Vec<(String, Option<server::CredentialOrigin>)>>>;
+
+#[async_trait::async_trait]
+impl server::CredentialValidator for RecordingCredentialValidator {
+    async fn validate(
+        &self,
+        credentials: &server::Credentials,
+    ) -> Result<server::CredentialDecision, server::CredentialValidationError> {
+        self.0.lock().unwrap().push((credentials.username.clone(), None));
+        Ok(server::CredentialDecision::Accept)
+    }
+
+    async fn validate_received(
+        &self,
+        credentials: &server::Credentials,
+        origin: server::CredentialOrigin,
+    ) -> Result<server::CredentialDecision, server::CredentialValidationError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((credentials.username.clone(), Some(origin)));
+        Ok(server::CredentialDecision::Accept)
+    }
+}
+
+/// Falling back to a normal logon doesn't skip the credential validator.
+/// When it rejects the Client Info credentials, the connection is refused.
+// oracle: mutant the fallback admits a client whose credentials the validator rejects
+#[tokio::test]
+async fn an_unverifiable_auto_reconnect_cookie_is_refused_when_the_validator_rejects_the_credentials() {
+    let (mut server, display_tx) = auto_reconnect_server(false);
+    server.set_credential_validator(Some(Arc::new(server::ExactMatchCredentialValidator::new(
+        server::Credentials {
+            username: "someone-else".into(),
+            password: "other".into(),
+            domain: None,
+        },
+    ))));
+
+    let ended = run_auto_reconnect_server(server, display_tx, async |server_addr, _cookie_handle, _display_tx| {
+        let mut probe = CookieProbe::connect(server_addr, Some(stale_auto_reconnect_cookie())).await;
+        probe.watch_for_cookie(Duration::from_secs(5)).await.is_err()
+    })
+    .await;
+
+    assert!(ended, "the server ends the connection");
+}
+
+/// With a connection binder, the server refuses every auto-reconnect attempt, whether its cookie verifies or not,
+/// because the acceptor skips capability-exchange binding for one, so admitting it would start a session no binder
+/// bound.
+/// The validator accepts the client's credentials, so nothing else refuses a fallback logon.
+// oracle: mutant a server with a connection binder admitting an auto-reconnect attempt it never binds
+#[rstest::rstest]
+#[case::stale_cookie(stale_auto_reconnect_cookie())]
+#[case::verified_cookie(ServerAutoReconnect {
+    logon_id: 1,
+    random_bits: [0x5a; 16],
+})]
+#[tokio::test]
+async fn an_auto_reconnect_attempt_is_refused_with_a_connection_binder(#[case] cookie: ServerAutoReconnect) {
+    let (mut server, display_tx) = auto_reconnect_server(false);
+    server.set_credential_validator(Some(Arc::new(server::ExactMatchCredentialValidator::new(
+        server::Credentials {
+            username: USERNAME.into(),
+            password: PASSWORD.into(),
+            domain: None,
+        },
+    ))));
+    let (_bound_tx, bound_rx) = mpsc::unbounded_channel();
+    server.set_connection_binder(Some(Arc::new(TestBinder(Arc::new(Mutex::new(bound_rx))))));
+
+    // A server that admits the attempt doesn't always end the run, so the run is bounded and running out of time counts
+    // as admitted.
+    let ended = tokio::time::timeout(
+        Duration::from_secs(20),
+        run_auto_reconnect_server(server, display_tx, async |server_addr, _cookie_handle, _display_tx| {
+            let mut probe = CookieProbe::connect(server_addr, Some(cookie)).await;
+            probe.watch_for_cookie(Duration::from_secs(5)).await.is_err()
+        }),
+    )
+    .await
+    .unwrap_or(false);
+
+    assert!(ended, "the server ends the connection instead of admitting it");
+}
+
+/// A connection binder that hands every connection the test display and input handler.
+struct TestBinder(DisplayUpdatesRx);
+
+#[async_trait::async_trait]
+impl server::ConnectionBinder for TestBinder {
+    async fn bind_connection(
+        &self,
+        _credentials: &server::Credentials,
+        _desktop_size: DesktopSize,
+    ) -> ServerResult<server::BoundConnection> {
+        Ok(server::BoundConnection {
+            display: Box::new(TestDisplay {
+                rx: Arc::clone(&self.0),
+                offers_display_control: true,
+            }),
+            input: Box::new(TestInputHandler),
+        })
+    }
 }
 
 /// On request, a vouch belongs to the connection that was current when the embedder sent
